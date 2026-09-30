@@ -1,0 +1,15 @@
+# The bench corpus allowlist: the only repositories tasks may come from.
+#
+# One line per repository:
+#   owner/name cleared_on=YYYY-MM-DD clearance=https://github.com/...
+#
+# FOUNDER GATE. A repository is added only after the founder gives its
+# egress clearance, that is, clears its code to be sent to the chosen
+# model providers. cleared_on is the date of that clearance and clearance
+# is the link to it. An entry without both refuses the whole corpus.
+#
+# A repository on the client list is never added, even one inside the
+# practice's organization. If the two lists overlap, the corpus build
+# refuses to start.
+#
+# No repository has an egress clearance yet, so this list is empty.
