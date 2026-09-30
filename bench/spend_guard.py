@@ -1,9 +1,8 @@
 """The bench spend guard (issue #1).
 
 Every model-fit run spends money, and spend is the founder's decision.
-This guard follows the threat model's spend section, section 6.4 of
-docs/specs/2026-09-30-vines-connectors-and-bench-threat-model.md in
-sageadvicellc/workbench:
+This guard follows the spend section, section 6.4, of "Threat model and
+eval spec: Vines connectors and the model-fit bench":
 
 1. Before any run, it prints a cost estimate: the run count times the
    price per run, with the price source named. Beside it, it prints the
