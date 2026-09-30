@@ -6,9 +6,11 @@ docstring states the rules.
 - `allowlist.txt` names the only repositories a task can come from. Each
   entry needs the founder's egress clearance. It is empty until she
   gives one.
-- `tasks/<task-id>/task.json` holds exactly `repo`, `commit`, `prompt`,
-  and `gates`. `prompt` is a `.md` or `.txt` file beside it. `gates` is a
-  list of commands, each a list of arguments, from the task's own repo.
+- `tasks/<task-id>/task.json` holds exactly `repo`, `commit`, `tree`,
+  `prompt`, and `gates`. `tree` is the commit's git tree id, which the
+  loader recomputes from the snapshot. `prompt` is a `.md` or `.txt` file
+  beside it. `gates` is a list of commands, each a list of arguments,
+  from the task's own repo.
 
 The loader also takes three paths at run time, and none of them is
 stored here:

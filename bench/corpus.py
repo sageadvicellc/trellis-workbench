@@ -8,37 +8,53 @@ model-fit bench" sets the rules this module enforces:
    client repository can live inside the practice's organization.
 2. Every repository on the client list (the merge gate's list of client
    repositories) is excluded, and the allowlist cannot override that.
-   When the two lists overlap, the corpus build refuses to start.
+   When the two lists overlap, the corpus build refuses to start. The
+   list matches by name only, so a renamed, moved, or forked client
+   repository needs its own line.
 3. A repository joins the allowlist only after the founder clears it for
    egress, that is, for sending its code to the chosen model providers.
    Each allowlist entry names the date and the link of that clearance.
    This is a founder gate: the shipped allowlist names no repository.
-4. Each task is frozen at one commit, and its snapshot is an export of
-   that commit: a snapshot that holds git metadata is refused.
-5. The sanitizer and a secret scan run on each task snapshot, and on the
-   task's own files, before it enters the corpus. A finding fails it.
-   Both scan file contents and file and folder names. Anything the scan
-   cannot read, such as a symlink, an unreadable file, a file too large,
-   or a file that is not UTF-8 text, is a finding too.
+4. Each task is frozen at one commit. Its task.json records that
+   commit's tree id, and the loader recomputes the git tree hash of the
+   snapshot and refuses a mismatch, so the snapshot is provably that
+   commit's content. An empty snapshot, and a snapshot that holds git
+   metadata, are refused.
+5. The sanitizer and a secret scan run on each task snapshot, on the
+   task's own files, and on the task id, before it enters the corpus. A
+   finding fails it. Both scan file contents and file and folder names.
+   Anything the scan cannot read in full, such as a symlink, a special
+   file, an unreadable file, a file too large, a file that is not UTF-8
+   text, or a Git LFS pointer, is a finding too.
 6. A task names the gates of its own repository, which grade it.
+7. The scan records a manifest of every file it read: path, size, and
+   SHA-256. A Task carries it, and check_manifest proves the bytes about
+   to be sent are the bytes that were scanned. Whatever sends a task
+   calls it first.
 
 The client list and the sanitizer's deny terms are read from files the
 caller names at run time. Neither is copied into this repository. A
 missing, empty, unreadable, or malformed list refuses the build, the same
 way the merge gate refuses every merge on a bad list.
 
-Deny terms and client names are matched after Unicode normalization
-(NFKC, case folding, and removal of invisible format characters), so a
-full-width or zero-width variant still matches. A finding and every error
-name a rule, and a file and line where the path itself is not a finding,
-never the text that matched.
+Deny terms and client names are matched after folding: invisible format
+characters removed, then NFKD, then combining marks removed, then case
+folding. White space is collapsed, and each term also matches with every
+separator removed on both sides, and across each pair of adjacent lines.
+Folding does not map lookalike letters from other scripts, such as a
+Cyrillic letter that looks Latin, so those can still evade a term.
+
+A finding and every error name a rule, and a file and line where the path
+itself is not a finding, never the text that matched.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 import unicodedata
 from dataclasses import dataclass
 from datetime import date
@@ -51,34 +67,42 @@ _TASK_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _PROMPT_FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:md|txt)")
 _CLEARANCE_URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9._/#?=-]{1,400}")
 _GATE_ARG_RE = re.compile(r"[\x20-\x7e]{1,256}")
-_TASK_FIELDS = frozenset({"repo", "commit", "prompt", "gates"})
+_TASK_FIELDS = frozenset({"repo", "commit", "tree", "prompt", "gates"})
 _MAX_GATES = 20
 _MAX_GATE_ARGS = 32
 _MAX_SCAN_BYTES = 5 * 1024 * 1024
 _MAX_NAMED_FINDINGS = 5
+_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
 
 _B = r"(?<![A-Za-z0-9])"  # a key starts at a word boundary
 _SECRET_PATTERNS = {
     "aws_access_key": re.compile(_B + r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    "aws_secret_key": re.compile(r"(?i)aws.{0,20}secret.{0,20}[=:]\s*['\"]?[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"),
     "github_token": re.compile(_B + r"(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})"),
     "gitlab_token": re.compile(_B + r"glpat-[A-Za-z0-9_-]{20,}"),
+    "huggingface_token": re.compile(_B + r"hf_[A-Za-z0-9]{30,}"),
     "anthropic_key": re.compile(_B + r"sk-ant-[A-Za-z0-9_-]{20,}"),
     "openai_key": re.compile(_B + r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     "stripe_key": re.compile(_B + r"[rs]k_live_[A-Za-z0-9]{20,}"),
     "slack_token": re.compile(_B + r"xox[abprs]-[A-Za-z0-9-]{10,}"),
     "slack_webhook": re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9/]+"),
     "google_api_key": re.compile(_B + r"AIza[0-9A-Za-z_-]{35}"),
+    "google_service_account": re.compile(r"\"type\"\s*:\s*\"service_account\""),
     "npm_token": re.compile(_B + r"npm_[A-Za-z0-9]{36}"),
     "sendgrid_key": re.compile(_B + r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"),
     "jwt": re.compile(_B + r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\."),
     "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     "url_with_password": re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:[^\s/@]+@"),
+    "password_assignment": re.compile(r"(?i)\b(?:password|passwd|pwd)\s*[:=]\s*['\"][^'\"\s]{6,}['\"]"),
 }
 _SECRET_FILE_RE = re.compile(
-    r"\.env(?:\..*)?|.*\.pem|.*\.p12|.*\.pfx|.*\.jks|.*\.key|id_rsa|id_ed25519|id_ecdsa|\.npmrc|\.netrc|\.pgpass",
+    r"\.env(?:\..*)?|.*\.pem|.*\.p12|.*\.pfx|.*\.jks|.*\.key|.*\.keystore|.*\.tfstate(?:\..*)?"
+    r"|id_rsa|id_ed25519|id_ecdsa|\.npmrc|\.netrc|\.pgpass|\.git-credentials|credentials|\.htpasswd",
     re.IGNORECASE,
 )
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+_WHITESPACE_RE = re.compile(r"\s+")
+_SEPARATOR_RE = re.compile(r"[\W_]+")
 
 
 class CorpusRefused(Exception):
@@ -101,22 +125,45 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class ManifestEntry:
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class Task:
     task_id: str
     repo: str
     commit: str
+    tree: str
     prompt_path: Path
     prompt_id: str
     gates: tuple
+    task_manifest: tuple
+    snapshot_path: Path
+    snapshot_manifest: tuple
 
     def prompt_text(self) -> str:
+        """The prompt, read again and checked against the scanned bytes."""
+        check_manifest(self.prompt_path.parent, self.task_manifest)
         return self.prompt_path.read_text(encoding="utf-8")
 
 
-def _fold(text: str) -> str:
-    """NFKC, case folding, and no invisible format characters."""
-    text = unicodedata.normalize("NFKC", text).casefold()
+def _strip_invisible(text: str) -> str:
     return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
+def _fold(text: str) -> str:
+    """Invisible format characters out, NFKD, combining marks out, case
+    folded, and white space collapsed to one space."""
+    text = unicodedata.normalize("NFKD", _strip_invisible(text))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn").casefold()
+    return _WHITESPACE_RE.sub(" ", text)
+
+
+def _squash(folded: str) -> str:
+    return _SEPARATOR_RE.sub("", folded)
 
 
 def _normal_repo(repo: str) -> str:
@@ -174,42 +221,109 @@ def read_client_list(path: Path) -> frozenset:
 
 
 def read_deny_terms(path: Path) -> tuple:
-    """The sanitizer's deny terms, one per line, matched after Unicode
-    folding. Missing or empty refuses the build."""
+    """The sanitizer's deny terms, one per line, matched after folding.
+    Missing or empty refuses the build."""
     terms = tuple(_fold(line) for line in _content_lines(path, "deny terms file"))
     if not terms:
         raise CorpusRefused("the deny terms file has no entries")
     return terms
 
 
-def _client_patterns(client_repos: frozenset) -> tuple:
-    """Each client as owner/name, and its name alone as a whole word when
-    the name has 4 or more characters."""
-    patterns = []
-    for repo in sorted(client_repos):
-        patterns.append(re.compile(re.escape(_fold(repo))))
-        name = _fold(repo.split("/", 1)[1])
-        if len(name) >= 4:
-            patterns.append(re.compile(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])"))
-    return tuple(patterns)
+class _Matcher:
+    """Deny terms and client names, matched on folded text: each term as
+    collapsed text and with separators removed on both sides, and each
+    client name as whole words with any separators, or none, between
+    them."""
+
+    def __init__(self, deny_terms: tuple, client_repos: frozenset):
+        self.terms = tuple((term, _squash(term)) for term in deny_terms if _squash(term))
+        patterns = []
+        for repo in sorted(client_repos):
+            owner, name = repo.split("/", 1)
+            for words, minimum in (((owner, name), 0), ((name,), 4)):
+                tokens = [t for w in words for t in _SEPARATOR_RE.split(_fold(w)) if t]
+                if tokens and len("".join(tokens)) >= minimum:
+                    body = r"[\W_]*".join(re.escape(t) for t in tokens)
+                    patterns.append(re.compile(r"(?<![a-z0-9])" + body + r"(?![a-z0-9])"))
+        self.clients = tuple(patterns)
+
+    def rules(self, text: str) -> list:
+        folded = _fold(text)
+        squashed = _squash(folded)
+        rules = []
+        if any(term in folded or squash in squashed for term, squash in self.terms):
+            rules.append("sanitizer:deny_term")
+        if any(pattern.search(folded) for pattern in self.clients):
+            rules.append("sanitizer:client_repository")
+        return rules
 
 
-def _sanitizer_hit(folded: str, deny_terms: tuple, client_patterns: tuple) -> list:
-    rules = []
-    if any(term in folded for term in deny_terms):
-        rules.append("sanitizer:deny_term")
-    if any(pattern.search(folded) for pattern in client_patterns):
-        rules.append("sanitizer:client_repository")
+def _secret_rules(text: str) -> list:
+    """Secret and email rules on the raw text and on the text with
+    invisible characters removed, so a zero-width character cannot hide a
+    key."""
+    stripped = unicodedata.normalize("NFKC", _strip_invisible(text))
+    rules = [f"secret:{rule}" for rule, pattern in _SECRET_PATTERNS.items()
+             if pattern.search(text) or pattern.search(stripped)]
+    if _EMAIL_RE.search(text) or _EMAIL_RE.search(stripped):
+        rules.append("sanitizer:email_address")
     return rules
 
 
-def scan_snapshot(root: Path, deny_terms: tuple, client_repos: frozenset) -> list:
-    """Run the secret scan and the sanitizer on every file and folder name
-    under root and on every file's text. Anything the scan cannot read is
-    a finding, so nothing passes unscanned."""
-    root = Path(root)
-    patterns = _client_patterns(client_repos)
+def _name_findings(relative: str, name: str, matcher: _Matcher) -> list:
+    findings = [Finding(relative, 0, rule + "_in_path") for rule in matcher.rules(relative)]
+    findings += [Finding(relative, 0, rule + "_in_path") for rule in _secret_rules(relative)]
+    if _SECRET_FILE_RE.fullmatch(name):
+        findings.append(Finding(relative, 0, "secret:secret_file_name"))
+    return findings
+
+
+def _read_regular(path: Path, cap: int):
+    """Read a regular file without following a link or blocking, at most
+    cap plus one bytes. Returns bytes, or a finding rule."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return "sanitizer:unreadable"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "sanitizer:not_a_regular_file"
+        chunks, total = [], 0
+        while total <= cap:
+            chunk = os.read(fd, min(1024 * 1024, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > cap:
+            return "sanitizer:file_too_large"
+        return b"".join(chunks)
+    except OSError:
+        return "sanitizer:unreadable"
+    finally:
+        os.close(fd)
+
+
+def _scan_text(relative: str, text: str, matcher: _Matcher) -> list:
     findings = []
+    lines = text.split("\n")  # newlines only, so a form feed cannot split a key
+    for number, line in enumerate(lines, start=1):
+        for rule in _secret_rules(line) + matcher.rules(line):
+            findings.append(Finding(relative, number, rule))
+        if number < len(lines):
+            joined = line + " " + lines[number]
+            for rule in matcher.rules(joined):
+                if rule not in matcher.rules(line) and rule not in matcher.rules(lines[number]):
+                    findings.append(Finding(relative, number, rule + "_across_lines"))
+    return findings
+
+
+def _scan(root: Path, matcher: _Matcher):
+    """Scan every name and every file under root. Returns the findings and
+    the manifest of the files read."""
+    root = Path(root)
+    findings, manifest = [], []
 
     def unreadable(error):
         name = getattr(error, "filename", None)
@@ -221,8 +335,7 @@ def scan_snapshot(root: Path, deny_terms: tuple, client_repos: frozenset) -> lis
         for name in sorted(subdirectories):
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
-            for rule in _sanitizer_hit(_fold(relative), deny_terms, patterns):
-                findings.append(Finding(relative, 0, rule + "_in_path"))
+            findings.extend(_name_findings(relative, name, matcher))
             if path.is_symlink():
                 findings.append(Finding(relative, 0, "sanitizer:symlink"))
             elif name == ".git":
@@ -233,40 +346,83 @@ def scan_snapshot(root: Path, deny_terms: tuple, client_repos: frozenset) -> lis
         for name in sorted(files):
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
-            for rule in _sanitizer_hit(_fold(relative), deny_terms, patterns):
-                findings.append(Finding(relative, 0, rule + "_in_path"))
-            if path.is_symlink():
+            findings.extend(_name_findings(relative, name, matcher))
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError:
+                findings.append(Finding(relative, 0, "sanitizer:unreadable"))
+                continue
+            if stat.S_ISLNK(mode):
                 findings.append(Finding(relative, 0, "sanitizer:symlink"))
                 continue
             if name == ".git":
                 findings.append(Finding(relative, 0, "sanitizer:git_metadata"))
                 continue
-            if _SECRET_FILE_RE.fullmatch(name):
-                findings.append(Finding(relative, 0, "secret:secret_file_name"))
-            try:
-                if path.stat().st_size > _MAX_SCAN_BYTES:
-                    findings.append(Finding(relative, 0, "sanitizer:file_too_large"))
-                    continue
-                data = path.read_bytes()
-            except OSError:
-                findings.append(Finding(relative, 0, "sanitizer:unreadable"))
+            if not stat.S_ISREG(mode):
+                findings.append(Finding(relative, 0, "sanitizer:not_a_regular_file"))
                 continue
+            data = _read_regular(path, _MAX_SCAN_BYTES)
+            if isinstance(data, str):
+                findings.append(Finding(relative, 0, data))
+                continue
+            manifest.append(ManifestEntry(relative, len(data), hashlib.sha256(data).hexdigest()))
+            if data.startswith(_LFS_POINTER_PREFIX):
+                findings.append(Finding(relative, 0, "sanitizer:lfs_pointer"))
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError:
                 findings.append(Finding(relative, 0, "sanitizer:not_utf8_text"))
                 continue
-            # Split on newlines only, so a form feed or other line separator
-            # cannot split a key in two.
-            for number, line in enumerate(text.split("\n"), start=1):
-                for rule, pattern in _SECRET_PATTERNS.items():
-                    if pattern.search(line):
-                        findings.append(Finding(relative, number, f"secret:{rule}"))
-                if _EMAIL_RE.search(line):
-                    findings.append(Finding(relative, number, "sanitizer:email_address"))
-                for rule in _sanitizer_hit(_fold(line), deny_terms, patterns):
-                    findings.append(Finding(relative, number, rule))
-    return findings
+            findings.extend(_scan_text(relative, text, matcher))
+    return findings, tuple(manifest)
+
+
+def scan_snapshot(root: Path, deny_terms: tuple, client_repos: frozenset) -> list:
+    """Run the secret scan and the sanitizer on every file and folder name
+    under root and on every file's text. Anything the scan cannot read in
+    full is a finding, so nothing passes unscanned."""
+    return _scan(root, _Matcher(deny_terms, client_repos))[0]
+
+
+def check_manifest(root: Path, manifest: tuple) -> None:
+    """Prove the files under root are exactly the scanned ones, byte for
+    byte, or raise CorpusRefused. Whatever sends a task calls this
+    first."""
+    findings, current = _scan(root, _Matcher((), frozenset()))
+    unreadable = [f for f in findings if not f.rule.startswith(("secret:", "sanitizer:email"))]
+    if unreadable or current != tuple(manifest):
+        raise CorpusRefused("the files changed after they were scanned")
+
+
+def git_tree_hash(root: Path, algorithm: str = "sha1") -> str:
+    """The git tree id of the regular files under root, computed as git
+    computes it: blobs, then trees with entries sorted by name, a folder
+    compared as its name plus a slash. A symlink or special file raises,
+    because the scan refuses them."""
+    def object_id(kind: bytes, body: bytes) -> bytes:
+        return hashlib.new(algorithm, kind + b" " + str(len(body)).encode() + b"\0" + body).digest()
+
+    def tree(directory: Path) -> bytes:
+        entries = []
+        for entry in os.scandir(directory):
+            mode = entry.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                if entry.name == ".git":
+                    raise CorpusRefused("the snapshot holds git metadata")
+                entries.append((entry.name + "/", b"40000", entry.name, tree(Path(entry.path))))
+            elif stat.S_ISREG(mode):
+                data = Path(entry.path).read_bytes()
+                file_mode = b"100755" if mode & 0o111 else b"100644"
+                entries.append((entry.name, file_mode, entry.name, object_id(b"blob", data)))
+            else:
+                raise CorpusRefused("the snapshot holds a file git cannot hash")
+        body = b"".join(
+            file_mode + b" " + name.encode("utf-8") + b"\0" + digest
+            for _key, file_mode, name, digest in sorted(entries, key=lambda item: item[0].encode("utf-8"))
+        )
+        return object_id(b"tree", body)
+
+    return tree(Path(root)).hex()
 
 
 def _describe(findings: list) -> str:
@@ -296,16 +452,23 @@ def _valid_gates(gates) -> bool:
     )
 
 
-def _load_task(task_dir: Path, allowed: dict, clients: frozenset, deny_terms: tuple,
+def _load_task(task_dir: Path, allowed: dict, clients: frozenset, matcher: _Matcher,
                snapshot_root: Path) -> Task:
     task_id = task_dir.name
+    # The task's own folder is scanned before task.json is parsed.
+    findings, task_manifest = _scan(task_dir, matcher)
+    if findings:
+        raise CorpusRefused(f"task {task_id}: its own files {_describe(findings)}")
+    spec_bytes = _read_regular(task_dir / "task.json", _MAX_SCAN_BYTES)
     try:
-        spec = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        if isinstance(spec_bytes, str):
+            raise ValueError
+        spec = json.loads(spec_bytes.decode("utf-8"))
+    except ValueError:
         raise CorpusRefused(f"task {task_id}: task.json is missing or not JSON") from None
     if not isinstance(spec, dict) or set(spec) != _TASK_FIELDS:
-        raise CorpusRefused(f"task {task_id}: task.json must hold exactly repo, commit, prompt, and gates")
-    repo, commit, prompt, gates = spec["repo"], spec["commit"], spec["prompt"], spec["gates"]
+        raise CorpusRefused(f"task {task_id}: task.json must hold exactly repo, commit, tree, prompt, and gates")
+    repo, commit, tree, prompt, gates = (spec[k] for k in ("repo", "commit", "tree", "prompt", "gates"))
     if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
         raise CorpusRefused(f"task {task_id}: repo is not an owner/name repository")
     if _normal_repo(repo) in clients:
@@ -314,17 +477,16 @@ def _load_task(task_dir: Path, allowed: dict, clients: frozenset, deny_terms: tu
         raise CorpusRefused(f"task {task_id}: the repository is not on the allowlist")
     if not isinstance(commit, str) or not _COMMIT_RE.fullmatch(commit):
         raise CorpusRefused(f"task {task_id}: commit is not a full 40-hex or 64-hex commit")
+    if not isinstance(tree, str) or not _COMMIT_RE.fullmatch(tree) or len(tree) != len(commit):
+        raise CorpusRefused(f"task {task_id}: tree is not a full tree id in the commit's hash format")
     if not isinstance(prompt, str) or not _PROMPT_FILE_RE.fullmatch(prompt):
         raise CorpusRefused(f"task {task_id}: prompt must be a .md or .txt file in the task directory")
     prompt_path = task_dir / prompt
-    if prompt_path.is_symlink() or not prompt_path.is_file():
+    if prompt not in {entry.path for entry in task_manifest}:
         raise CorpusRefused(f"task {task_id}: the prompt file is missing")
     if not _valid_gates(gates):
         raise CorpusRefused(f"task {task_id}: gates must be 1 to {_MAX_GATES} commands, each a list of arguments")
 
-    findings = scan_snapshot(task_dir, deny_terms, clients)
-    if findings:
-        raise CorpusRefused(f"task {task_id}: its own files {_describe(findings)}")
     root = Path(snapshot_root).resolve()
     snapshot = Path(snapshot_root) / repo / commit
     try:
@@ -333,17 +495,26 @@ def _load_task(task_dir: Path, allowed: dict, clients: frozenset, deny_terms: tu
         inside = False
     if not inside or snapshot.is_symlink() or not snapshot.is_dir():
         raise CorpusRefused(f"task {task_id}: no snapshot exists at the frozen commit")
-    findings = scan_snapshot(snapshot, deny_terms, clients)
+    findings, snapshot_manifest = _scan(snapshot, matcher)
     if findings:
         raise CorpusRefused(f"task {task_id}: the snapshot {_describe(findings)}")
+    if not snapshot_manifest:
+        raise CorpusRefused(f"task {task_id}: the snapshot is empty")
+    algorithm = "sha1" if len(tree) == 40 else "sha256"
+    if git_tree_hash(snapshot, algorithm) != tree:
+        raise CorpusRefused(f"task {task_id}: the snapshot is not the recorded tree of that commit")
 
     return Task(
         task_id=task_id,
         repo=repo,
         commit=commit,
+        tree=tree,
         prompt_path=prompt_path,
         prompt_id=f"tasks/{task_id}/{prompt}",
         gates=tuple(tuple(gate) for gate in gates),
+        task_manifest=task_manifest,
+        snapshot_path=snapshot,
+        snapshot_manifest=snapshot_manifest,
     )
 
 
@@ -361,7 +532,7 @@ def load_corpus(*, corpus_dir: Path, allowlist_path: Path, client_list_path: Pat
     clients = read_client_list(client_list_path)
     if set(allowed) & clients:
         raise CorpusRefused("the allowlist names a repository on the client list")
-    deny_terms = read_deny_terms(deny_terms_path)
+    matcher = _Matcher(read_deny_terms(deny_terms_path), clients)
 
     tasks_dir = Path(corpus_dir) / "tasks"
     if not tasks_dir.is_dir():
@@ -374,8 +545,11 @@ def load_corpus(*, corpus_dir: Path, allowlist_path: Path, client_list_path: Pat
         if not _TASK_ID_RE.fullmatch(entry.name):
             problems.append("a task id is not a lowercase slug")
             continue
+        if matcher.rules(entry.name) or _secret_rules(entry.name):
+            problems.append("a task id failed the sanitizer, so it is not shown")
+            continue
         try:
-            tasks.append(_load_task(entry, allowed, clients, deny_terms, snapshot_root))
+            tasks.append(_load_task(entry, allowed, clients, matcher, snapshot_root))
         except CorpusRefused as problem:
             problems.append(str(problem))
     if problems:

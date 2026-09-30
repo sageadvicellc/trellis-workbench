@@ -1,0 +1,5 @@
+# The corpus allowlist decides which repositories' code may be sent to
+# model providers. Each entry needs the founder's egress clearance, so
+# the founder owns this file. Requiring code-owner review is a repository
+# setting, and it is the owner's to turn on.
+/corpus/allowlist.txt @hannasage
