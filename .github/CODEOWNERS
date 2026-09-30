@@ -10,3 +10,5 @@
 # decide what runs and what it may spend.
 /.github/ @hannasage
 /bench/spend_guard.py @hannasage
+/bench/egress.py @hannasage
+/bench/guards.py @hannasage
