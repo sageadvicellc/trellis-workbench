@@ -80,11 +80,16 @@ WEIGHTS_KINDS = ("file", "manifest", "provider_snapshot")
 # A date inside a snapshot id: YYYYMMDD, or YYYY-MM-DD with the same
 # separator both times. datetime.strptime then proves it is a real date.
 _SNAPSHOT_DATE_RE = re.compile(r"(?<![0-9])((?:19|20)[0-9]{2})(-?)([0-9]{2})\2([0-9]{2})(?![0-9])")
-# Words that name a moving target, never a fixed snapshot.
+# True aliases: names that always point at something else, never a fixed
+# snapshot. Words such as preview, beta, or dev are often part of a fixed
+# product name, and the checked date is what fixes a snapshot, so they
+# are allowed.
 _MOVING_SNAPSHOT_WORDS = frozenset({
-    "latest", "preview", "beta", "alpha", "exp", "experimental", "nightly",
-    "canary", "dev", "current", "main", "master", "head",
+    "latest", "current", "main", "master", "head", "nightly", "canary", "stable", "next", "default",
 })
+# Split a model id into whole tokens: at - _ . : /, at a lowercase to
+# uppercase change, and at a letter-digit change.
+_TOKEN_SPLIT_RE = re.compile(r"[-_.:/]|(?<=[a-z])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])")
 
 # Up to three parts split by `/`, such as a host, an organization, and a
 # model with a `:tag` (an Ollama tag or a quantization suffix).
@@ -197,7 +202,7 @@ def _has_real_date(snapshot_id: str) -> bool:
 
 
 def _names_a_moving_target(snapshot_id: str) -> bool:
-    return any(word in _MOVING_SNAPSHOT_WORDS for word in re.split(r"[-_.:/]", snapshot_id.lower()))
+    return any(token.lower() in _MOVING_SNAPSHOT_WORDS for token in _TOKEN_SPLIT_RE.split(snapshot_id))
 
 
 def provider_snapshot_digest(provider: str, snapshot_id: str) -> str:
@@ -303,6 +308,7 @@ def verify_pin(
     model_version: str,
     runtime_version: str,
     client_version: str,
+    endpoint_kind: str,
     served_model_id: Optional[str] = None,
 ) -> None:
     """Check a pin against what is actually on disk, or raise PinMismatch
@@ -315,16 +321,22 @@ def verify_pin(
     before it calls the spend guard, so a run never spends on inputs
     that differ from its pin.
 
-    The harness picks the kind to verify from the endpoint type, never
-    from the pin. For a provider_snapshot pin, weights_digest and
-    model_version are not trusted: served_model_id is the model id the
-    provider's response reports, it must equal the pin's model_id, and
-    this function computes the snapshot digest itself from it.
+    endpoint_kind is the kind the harness takes from the endpoint type,
+    never from the pin; a pin of another kind is a mismatch. Whenever
+    served_model_id is given, the model id the endpoint reports serving,
+    it must equal the pin's model_id, for every kind. For a
+    provider_snapshot pin it is required, weights_digest and model_version
+    are not trusted, and this function computes the snapshot digest itself
+    from the served id.
     """
     if not isinstance(pin, RunPin):
         raise PinMismatch("there is no pin to verify")
+    if endpoint_kind != pin.weights_kind:
+        raise PinMismatch("the pin does not match what is on disk: ['weights_kind']")
+    if served_model_id is not None and served_model_id != pin.model_id:
+        raise PinMismatch("the pin does not match what is on disk: ['model_id']")
     if pin.weights_kind == "provider_snapshot":
-        if not isinstance(served_model_id, str) or pin.model_id != served_model_id:
+        if not isinstance(served_model_id, str):
             raise PinMismatch("the pin does not match what is on disk: ['model_id']")
         served_digest = provider_snapshot_digest(pin.runtime_name, served_model_id)
         weights_digest = served_digest
