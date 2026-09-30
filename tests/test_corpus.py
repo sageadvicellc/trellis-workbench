@@ -10,6 +10,7 @@ Run with: python3 -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -28,17 +29,26 @@ from bench.corpus import (  # noqa: E402
     check_manifest,
     git_tree_hash,
     load_corpus,
+    verify_commit_object,
     read_allowlist,
     read_client_list,
     scan_snapshot,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-COMMIT = "a" * 40
 REPO = "example-org/example-repo"
 CLIENT = "example-org/client-site"
 CLEARANCE = "https://github.com/example-org/decisions/issues/1#issuecomment-1"
 AWS_KEY = "AK" + "IA" + "IOSFODNN7EXAMPLE"
+DEFAULT_FILES = {"src/parser.py": "def parse(text):\n    return text\n"}
+
+
+def commit_object(tree, algorithm="sha1", message="Example commit"):
+    """A raw commit object for tree, with a made-up author, and its id."""
+    person = "Example Author <author@example.invalid> 1790000000 +0000"
+    data = f"tree {tree}\nauthor {person}\ncommitter {person}\n\n{message}\n".encode()
+    commit = hashlib.new(algorithm, b"commit " + str(len(data)).encode() + b"\0" + data).hexdigest()
+    return data, commit
 
 
 class Fixture:
@@ -55,17 +65,41 @@ class Fixture:
         self.allowlist.write_text(f"# header\n{REPO} cleared_on=2026-09-30 clearance={CLEARANCE}\n")
         self.clients.write_text(f"# client repos\n{CLIENT}\n")
         self.deny.write_text("# deny terms\nzz private term\n")
-        self.snapshot(REPO, COMMIT)
+        self.objects = {}
+        self.commit = self.snapshot_at(REPO, DEFAULT_FILES)
         self.add_task("parser-fix")
 
-    def add_task(self, task_id, repo=REPO, commit=COMMIT, prompt="prompt.md", gates=None, extra=None,
+    def snapshot_at(self, repo, files, algorithm="sha1"):
+        """A snapshot built as a real commit would give it: the files, the
+        tree id, a commit object, and the commit id it hashes to."""
+        staging = self.root / "staging"
+        shutil.rmtree(staging, ignore_errors=True)
+        for name, text in files.items():
+            path = staging / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        tree = git_tree_hash(staging, algorithm)
+        data, commit = commit_object(tree, algorithm)
+        target = self.snapshots / repo / commit
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staging), str(target))
+        self.objects[commit] = (data, tree)
+        return commit
+
+    def add_task(self, task_id, repo=REPO, commit=None, prompt="prompt.md", gates=None, extra=None,
                  prompt_text="Fix the failing parser test.", tree="auto"):
+        commit = self.commit if commit is None else commit
         task_dir = self.corpus / "tasks" / task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "prompt.md").write_text(prompt_text)
+        if commit in self.objects:
+            (task_dir / "commit.object").write_bytes(self.objects[commit][0])
         if tree == "auto":
-            snapshot = self.snapshots / repo / commit
-            tree = git_tree_hash(snapshot) if snapshot.is_dir() else "0" * 40
+            if commit in self.objects:
+                tree = self.objects[commit][1]
+            else:
+                snapshot = self.snapshots / repo / commit
+                tree = git_tree_hash(snapshot) if snapshot.is_dir() else "0" * (64 if len(commit) == 64 else 40)
         task = {"repo": repo, "commit": commit, "tree": tree, "prompt": prompt,
                 "gates": gates if gates is not None else [["npm", "run", "test"], ["npm", "run", "lint"]]}
         if extra:
@@ -133,7 +167,7 @@ class ValidTaskTests(CorpusTestCase):
         task = tasks[0]
         self.assertEqual(task.task_id, "parser-fix")
         self.assertEqual(task.repo, REPO)
-        self.assertEqual(task.commit, COMMIT)
+        self.assertEqual(task.commit, self.fx.commit)
         self.assertEqual(task.prompt_id, "tasks/parser-fix/prompt.md")
         self.assertEqual(task.gates, (("npm", "run", "test"), ("npm", "run", "lint")))
         self.assertEqual(task.prompt_text(), "Fix the failing parser test.")
@@ -146,7 +180,7 @@ class ValidTaskTests(CorpusTestCase):
 
 class ForbiddenSourceTests(CorpusTestCase):
     def test_a_task_from_a_repo_off_the_allowlist_is_refused(self):
-        self.fx.snapshot("example-org/not-cleared", COMMIT)
+        self.fx.snapshot("example-org/not-cleared", self.fx.commit)
         self.fx.add_task("other", repo="example-org/not-cleared")
         self.assertRefused("task other: the repository is not on the allowlist")
 
@@ -179,7 +213,7 @@ class ForbiddenSourceTests(CorpusTestCase):
                 self.assertRefused("task dots: repo is not an owner/name repository")
 
     def test_mixed_case_repo_matches_its_allowlist_entry(self):
-        self.fx.snapshot(REPO.upper(), COMMIT)
+        self.fx.snapshot(REPO.upper(), self.fx.commit, DEFAULT_FILES)
         self.fx.add_task("parser-fix", repo=REPO.upper())
         self.assertEqual(len(self.fx.load()), 1)
 
@@ -219,12 +253,18 @@ class ForbiddenSourceTests(CorpusTestCase):
         self.assertEqual(read_allowlist(shipped), {})
         self.assertIn("egress clearance", shipped.read_text())
 
-    def test_codeowners_names_an_owner_for_the_allowlist(self):
+    def test_codeowners_names_an_owner_for_the_allowlist_tasks_and_itself(self):
         lines = (REPO_ROOT / ".github" / "CODEOWNERS").read_text().splitlines()
-        entries = [line.split() for line in lines if line.strip() and not line.startswith("#")]
-        self.assertIn("/corpus/allowlist.txt", [entry[0] for entry in entries])
-        owners = [entry[1:] for entry in entries if entry[0] == "/corpus/allowlist.txt"][0]
-        self.assertTrue(owners and all(owner.startswith("@") for owner in owners))
+        entries = {line.split()[0]: line.split()[1:] for line in lines if line.strip() and not line.startswith("#")}
+        for path in ["/corpus/allowlist.txt", "/corpus/tasks/", "/.github/CODEOWNERS"]:
+            with self.subTest(path=path):
+                owners = entries.get(path)
+                self.assertTrue(owners and all(owner.startswith("@") for owner in owners))
+
+    def test_the_readme_says_how_to_export_a_snapshot(self):
+        readme = " ".join((REPO_ROOT / "corpus" / "README.md").read_text().split())
+        self.assertIn("git archive <commit>", readme)
+        self.assertIn("no export attributes", readme)
 
     def test_a_missing_or_empty_deny_terms_file_refuses_the_build(self):
         self.fx.deny.write_text("# none\n")
@@ -241,10 +281,10 @@ class TaskShapeTests(CorpusTestCase):
                 self.assertRefused("task bad-commit: commit is not a full 40-hex or 64-hex commit")
 
     def test_a_64_hex_commit_and_tree_load(self):
-        self.fx.snapshot(REPO, "e" * 64)
-        self.fx.add_task("parser-fix", commit="e" * 64,
-                         tree=git_tree_hash(self.fx.snapshots / REPO / ("e" * 64), "sha256"))
-        self.assertEqual(self.fx.load()[0].commit, "e" * 64)
+        commit = self.fx.snapshot_at(REPO, DEFAULT_FILES, "sha256")
+        self.fx.add_task("parser-fix", commit=commit)
+        self.assertEqual(self.fx.load()[0].commit, commit)
+        self.assertEqual(len(commit), 64)
 
     def test_a_bad_tree_is_refused(self):
         for tree in [None, "main", "b" * 64]:
@@ -317,7 +357,8 @@ class TreeProofTests(CorpusTestCase):
             "a.b": "dot file\n", "a/inner.txt": "nested\n", "a-b.txt": "dash\n", "z/y/x.txt": "deep\n",
             "run.sh": "#!/bin/sh\n",
         })
-        (root / "run.sh").chmod(0o755)
+        (root / "run.sh").chmod(0o744)  # owner execute only, as git reads it
+        (root / "a.b").chmod(0o611)  # group and other execute, which git ignores
         self.assertEqual(git_tree_hash(root), self.git_write_tree(root))
         try:
             expected = self.git_write_tree(root, "sha256")
@@ -326,9 +367,7 @@ class TreeProofTests(CorpusTestCase):
         self.assertEqual(git_tree_hash(root, "sha256"), expected)
 
     def test_a_snapshot_that_is_not_the_recorded_tree_is_refused(self):
-        tree = git_tree_hash(self.fx.snapshots / REPO / COMMIT)
-        self.fx.snapshot(REPO, COMMIT, {"src/other.py": "copied in later\n"})
-        self.fx.add_task("parser-fix", tree=tree)
+        self.fx.snapshot(REPO, self.fx.commit, {"src/other.py": "copied in later\n"})
         self.assertRefused("task parser-fix: the snapshot is not the recorded tree of that commit")
 
     def test_an_empty_snapshot_is_refused(self):
@@ -336,6 +375,53 @@ class TreeProofTests(CorpusTestCase):
         empty.mkdir(parents=True)
         self.fx.add_task("empty", commit="d" * 40, tree="d" * 40)
         self.assertRefused("task empty: the snapshot is empty")
+
+
+class CommitObjectTests(CorpusTestCase):
+    def test_a_missing_commit_object_is_refused(self):
+        (self.fx.corpus / "tasks" / "parser-fix" / "commit.object").unlink()
+        self.assertRefused("task parser-fix: the commit object is missing")
+
+    def test_a_commit_object_that_does_not_hash_to_the_commit_is_refused(self):
+        path = self.fx.corpus / "tasks" / "parser-fix" / "commit.object"
+        path.write_bytes(path.read_bytes().replace(b"Example commit", b"Edited commit"))
+        self.assertRefused("task parser-fix: the commit object does not hash to the commit")
+
+    def test_a_commit_object_for_another_tree_is_refused(self):
+        data, commit = commit_object("f" * 40)
+        self.fx.snapshot(REPO, commit, DEFAULT_FILES)
+        self.fx.add_task("other-tree", commit=commit, tree=git_tree_hash(self.fx.snapshots / REPO / commit))
+        (self.fx.corpus / "tasks" / "other-tree" / "commit.object").write_bytes(data)
+        self.assertRefused("task other-tree: the commit object's tree line is not the recorded tree")
+
+    def test_verify_commit_object_matches_git_itself(self):
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        work = self.fx.root / "real-repo"
+        work.mkdir()
+        (work / "a.txt").write_text("a\n")
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(self.fx.root),
+                   GIT_AUTHOR_NAME="Example Author", GIT_AUTHOR_EMAIL="author@example.invalid",
+                   GIT_COMMITTER_NAME="Example Author", GIT_COMMITTER_EMAIL="author@example.invalid")
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(work), *args], check=True, env=env,
+                                  capture_output=True).stdout
+
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "Example commit")
+        commit = git("rev-parse", "HEAD").decode().strip()
+        tree = git("rev-parse", "HEAD^{tree}").decode().strip()
+        verify_commit_object(git("cat-file", "commit", commit), commit, tree)
+
+    def test_a_commit_object_in_a_snapshot_is_scanned(self):
+        rules = self.rules({"commit.object": "k = '" + AWS_KEY + "'\n"})
+        self.assertIn("secret:aws_access_key", rules)
+
+    def test_the_task_commit_object_is_hash_checked_not_content_scanned(self):
+        # The fixture's commit object holds an author email; the task loads.
+        self.assertEqual(len(self.fx.load()), 1)
 
 
 class ManifestTests(CorpusTestCase):
@@ -360,6 +446,26 @@ class ManifestTests(CorpusTestCase):
         task.prompt_path.write_text("a different prompt")
         with self.assertRaises(CorpusRefused):
             task.prompt_text()
+
+    def test_a_swap_after_the_check_cannot_reach_the_caller(self):
+        task = self.fx.load()[0]
+        real_read = corpus_module._read_regular
+
+        def read_then_swap(path, cap):
+            data = real_read(path, cap)
+            path.write_text("swapped in after the read")
+            return data
+
+        with mock.patch.object(corpus_module, "_read_regular", side_effect=read_then_swap):
+            text = task.prompt_text()
+        # The text returned is the bytes that were checked, not the swap.
+        self.assertEqual(text, "Fix the failing parser test.")
+
+    def test_the_prompt_is_read_once(self):
+        task = self.fx.load()[0]
+        with mock.patch.object(pathlib.Path, "read_text", side_effect=AssertionError("second read")), \
+                mock.patch.object(corpus_module, "check_manifest", side_effect=AssertionError("second read")):
+            self.assertEqual(task.prompt_text(), "Fix the failing parser test.")
 
 
 class SnapshotScanTests(CorpusTestCase):
@@ -416,6 +522,16 @@ class SnapshotScanTests(CorpusTestCase):
         for text in ["ＺＺ ＰＲＩＶＡＴＥ ＴＥＲＭ\n", "zz prívate term\n", "zz pri​vate term\n"]:
             with self.subTest(text=text):
                 self.assertIn("sanitizer:deny_term", self.rules({"a.md": text}))
+
+    def test_a_name_that_is_not_utf8_is_refused_not_a_crash(self):
+        entry = corpus_module.ManifestEntry("bad-\udcff.txt", 1, "0" * 64, blob_sha1="0" * 40, blob_sha256="0" * 64)
+        with self.assertRaises(CorpusRefused):
+            corpus_module.tree_hash_from_manifest((entry,))
+
+    def test_the_tree_hash_reads_no_file_again(self):
+        manifest = self.fx.load()[0].snapshot_manifest
+        with mock.patch.object(pathlib.Path, "read_bytes", side_effect=AssertionError("second read")):
+            self.assertEqual(corpus_module.tree_hash_from_manifest(manifest), self.fx.objects[self.fx.commit][1])
 
     def test_the_fold_order_strips_marks_after_decomposing(self):
         self.assertEqual(corpus_module._fold("É​COLE"), "ecole")
@@ -518,7 +634,7 @@ class SnapshotScanTests(CorpusTestCase):
         self.assertNotIn("private-term", message.lower())
 
     def test_a_clean_snapshot_has_no_findings(self):
-        root = self.fx.snapshots / REPO / COMMIT
+        root = self.fx.snapshots / REPO / self.fx.commit
         self.assertEqual(scan_snapshot(root, deny_terms=("zz private term",), client_repos=frozenset({CLIENT})), [])
 
     def test_client_list_entries_are_lowercased(self):

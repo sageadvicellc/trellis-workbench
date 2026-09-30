@@ -11,6 +11,12 @@ docstring states the rules.
   loader recomputes from the snapshot. `prompt` is a `.md` or `.txt` file
   beside it. `gates` is a list of commands, each a list of arguments,
   from the task's own repo.
+- `tasks/<task-id>/commit.object` holds the output of
+  `git cat-file commit <commit>`. The loader checks that it hashes to
+  `commit` and that its tree line is `tree`.
+
+Export each snapshot with a plain `git archive <commit>`, with no export
+attributes, so the files are exactly the commit's tree.
 
 The loader also takes three paths at run time, and none of them is
 stored here:

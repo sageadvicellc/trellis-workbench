@@ -15,11 +15,17 @@ model-fit bench" sets the rules this module enforces:
    egress, that is, for sending its code to the chosen model providers.
    Each allowlist entry names the date and the link of that clearance.
    This is a founder gate: the shipped allowlist names no repository.
-4. Each task is frozen at one commit. Its task.json records that
-   commit's tree id, and the loader recomputes the git tree hash of the
-   snapshot and refuses a mismatch, so the snapshot is provably that
-   commit's content. An empty snapshot, and a snapshot that holds git
-   metadata, are refused.
+4. Each task is frozen at one commit. Its task.json records the commit
+   and tree ids, and its folder holds the raw commit object, the output
+   of `git cat-file commit <commit>`, as commit.object. The loader checks
+   that the object hashes to the commit, that its tree line is the
+   recorded tree, and that the snapshot's git tree hash equals that tree.
+   That proves the snapshot is the tree of that commit object. It does
+   not yet prove the commit belongs to the named repository: the corpus
+   builder, which fetches from the allowlisted remote, will add that
+   link. An empty snapshot, and a snapshot that holds git metadata, are
+   refused. commit.object holds author lines, so its name is scanned but
+   its content is only hash-checked; it is never sent to a provider.
 5. The sanitizer and a secret scan run on each task snapshot, on the
    task's own files, and on the task id, before it enters the corpus. A
    finding fails it. Both scan file contents and file and folder names.
@@ -73,6 +79,7 @@ _MAX_GATE_ARGS = 32
 _MAX_SCAN_BYTES = 5 * 1024 * 1024
 _MAX_NAMED_FINDINGS = 5
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
+_COMMIT_OBJECT = "commit.object"
 
 _B = r"(?<![A-Za-z0-9])"  # a key starts at a word boundary
 _SECRET_PATTERNS = {
@@ -126,9 +133,15 @@ class Finding:
 
 @dataclass(frozen=True)
 class ManifestEntry:
+    """One scanned file: its path, size, and SHA-256, plus what git needs
+    to hash it into a tree: the owner's execute bit and its blob ids."""
+
     path: str
     size: int
     sha256: str
+    executable: bool = False
+    blob_sha1: str = ""
+    blob_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -145,9 +158,18 @@ class Task:
     snapshot_manifest: tuple
 
     def prompt_text(self) -> str:
-        """The prompt, read again and checked against the scanned bytes."""
-        check_manifest(self.prompt_path.parent, self.task_manifest)
-        return self.prompt_path.read_text(encoding="utf-8")
+        """The prompt, read once and decoded only if those bytes match the
+        scanned ones in size and SHA-256."""
+        entry = next((e for e in self.task_manifest if e.path == self.prompt_path.name), None)
+        data = _read_regular(self.prompt_path, _MAX_SCAN_BYTES)
+        if (
+            entry is None
+            or isinstance(data, str)
+            or len(data) != entry.size
+            or hashlib.sha256(data).hexdigest() != entry.sha256
+        ):
+            raise CorpusRefused("the prompt changed after it was scanned")
+        return data.decode("utf-8")
 
 
 def _strip_invisible(text: str) -> str:
@@ -319,9 +341,11 @@ def _scan_text(relative: str, text: str, matcher: _Matcher) -> list:
     return findings
 
 
-def _scan(root: Path, matcher: _Matcher):
+def _scan(root: Path, matcher: _Matcher, hash_only: frozenset = frozenset()):
     """Scan every name and every file under root. Returns the findings and
-    the manifest of the files read."""
+    the manifest of the files read. A top-level file named in hash_only
+    goes into the manifest, but its content is not scanned; only a task
+    folder passes one, for its commit object."""
     root = Path(root)
     findings, manifest = [], []
 
@@ -365,7 +389,17 @@ def _scan(root: Path, matcher: _Matcher):
             if isinstance(data, str):
                 findings.append(Finding(relative, 0, data))
                 continue
-            manifest.append(ManifestEntry(relative, len(data), hashlib.sha256(data).hexdigest()))
+            header = b"blob " + str(len(data)).encode() + b"\0"
+            manifest.append(ManifestEntry(
+                relative,
+                len(data),
+                hashlib.sha256(data).hexdigest(),
+                executable=bool(mode & stat.S_IXUSR),
+                blob_sha1=hashlib.sha1(header + data).hexdigest(),
+                blob_sha256=hashlib.sha256(header + data).hexdigest(),
+            ))
+            if name in hash_only and Path(directory) == root:
+                continue  # the commit object: author lines, hash-checked, never sent
             if data.startswith(_LFS_POINTER_PREFIX):
                 findings.append(Finding(relative, 0, "sanitizer:lfs_pointer"))
             try:
@@ -394,35 +428,57 @@ def check_manifest(root: Path, manifest: tuple) -> None:
         raise CorpusRefused("the files changed after they were scanned")
 
 
-def git_tree_hash(root: Path, algorithm: str = "sha1") -> str:
-    """The git tree id of the regular files under root, computed as git
-    computes it: blobs, then trees with entries sorted by name, a folder
-    compared as its name plus a slash. A symlink or special file raises,
-    because the scan refuses them."""
+def tree_hash_from_manifest(manifest: tuple, algorithm: str = "sha1") -> str:
+    """The git tree id of the scanned files, from the blob ids the scan
+    already worked out, so no file is read twice. Entries are sorted as
+    git sorts them, a folder compared as its name plus a slash; the mode
+    is 100755 when the owner may execute the file, as git decides. A name
+    that is not UTF-8 raises CorpusRefused."""
     def object_id(kind: bytes, body: bytes) -> bytes:
         return hashlib.new(algorithm, kind + b" " + str(len(body)).encode() + b"\0" + body).digest()
 
-    def tree(directory: Path) -> bytes:
-        entries = []
-        for entry in os.scandir(directory):
-            mode = entry.stat(follow_symlinks=False).st_mode
-            if stat.S_ISDIR(mode):
-                if entry.name == ".git":
-                    raise CorpusRefused("the snapshot holds git metadata")
-                entries.append((entry.name + "/", b"40000", entry.name, tree(Path(entry.path))))
-            elif stat.S_ISREG(mode):
-                data = Path(entry.path).read_bytes()
-                file_mode = b"100755" if mode & 0o111 else b"100644"
-                entries.append((entry.name, file_mode, entry.name, object_id(b"blob", data)))
-            else:
-                raise CorpusRefused("the snapshot holds a file git cannot hash")
-        body = b"".join(
-            file_mode + b" " + name.encode("utf-8") + b"\0" + digest
-            for _key, file_mode, name, digest in sorted(entries, key=lambda item: item[0].encode("utf-8"))
-        )
-        return object_id(b"tree", body)
+    root: dict = {}
+    for entry in manifest:
+        node = root
+        *folders, name = entry.path.split("/")
+        for folder in folders:
+            node = node.setdefault(folder + "/", {})
+        blob = entry.blob_sha1 if algorithm == "sha1" else entry.blob_sha256
+        node[name] = (b"100755" if entry.executable else b"100644", bytes.fromhex(blob))
 
-    return tree(Path(root)).hex()
+    def tree(node: dict) -> bytes:
+        parts = []
+        try:
+            for key in sorted(node, key=lambda k: k.encode("utf-8")):
+                value = node[key]
+                if isinstance(value, dict):
+                    parts.append(b"40000 " + key[:-1].encode("utf-8") + b"\0" + tree(value))
+                else:
+                    file_mode, digest = value
+                    parts.append(file_mode + b" " + key.encode("utf-8") + b"\0" + digest)
+        except UnicodeEncodeError:
+            raise CorpusRefused("a file name in the snapshot is not UTF-8") from None
+        return object_id(b"tree", b"".join(parts))
+
+    return tree(root).hex()
+
+
+def git_tree_hash(root: Path, algorithm: str = "sha1") -> str:
+    """The git tree id of the regular files under root: one scan, then
+    tree_hash_from_manifest."""
+    return tree_hash_from_manifest(_scan(root, _Matcher((), frozenset()))[1], algorithm)
+
+
+def verify_commit_object(data: bytes, commit: str, tree: str) -> None:
+    """Raise CorpusRefused unless data, a raw commit object, hashes to
+    commit and names tree on its first line."""
+    algorithm = "sha1" if len(commit) == 40 else "sha256"
+    digest = hashlib.new(algorithm, b"commit " + str(len(data)).encode() + b"\0" + data).hexdigest()
+    if digest != commit:
+        raise CorpusRefused("the commit object does not hash to the commit")
+    first_line = data.split(b"\n", 1)[0]
+    if first_line != b"tree " + tree.encode("ascii"):
+        raise CorpusRefused("the commit object's tree line is not the recorded tree")
 
 
 def _describe(findings: list) -> str:
@@ -456,7 +512,7 @@ def _load_task(task_dir: Path, allowed: dict, clients: frozenset, matcher: _Matc
                snapshot_root: Path) -> Task:
     task_id = task_dir.name
     # The task's own folder is scanned before task.json is parsed.
-    findings, task_manifest = _scan(task_dir, matcher)
+    findings, task_manifest = _scan(task_dir, matcher, hash_only=frozenset({_COMMIT_OBJECT}))
     if findings:
         raise CorpusRefused(f"task {task_id}: its own files {_describe(findings)}")
     spec_bytes = _read_regular(task_dir / "task.json", _MAX_SCAN_BYTES)
@@ -501,8 +557,19 @@ def _load_task(task_dir: Path, allowed: dict, clients: frozenset, matcher: _Matc
     if not snapshot_manifest:
         raise CorpusRefused(f"task {task_id}: the snapshot is empty")
     algorithm = "sha1" if len(tree) == 40 else "sha256"
-    if git_tree_hash(snapshot, algorithm) != tree:
+    try:
+        snapshot_tree = tree_hash_from_manifest(snapshot_manifest, algorithm)
+    except CorpusRefused as problem:
+        raise CorpusRefused(f"task {task_id}: {problem}") from None
+    if snapshot_tree != tree:
         raise CorpusRefused(f"task {task_id}: the snapshot is not the recorded tree of that commit")
+    commit_object = _read_regular(task_dir / _COMMIT_OBJECT, _MAX_SCAN_BYTES)
+    if isinstance(commit_object, str) or _COMMIT_OBJECT not in {e.path for e in task_manifest}:
+        raise CorpusRefused(f"task {task_id}: the commit object is missing")
+    try:
+        verify_commit_object(commit_object, commit, tree)
+    except CorpusRefused as problem:
+        raise CorpusRefused(f"task {task_id}: {problem}") from None
 
     return Task(
         task_id=task_id,
