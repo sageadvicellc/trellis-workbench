@@ -419,9 +419,107 @@ class CommitObjectTests(CorpusTestCase):
         rules = self.rules({"commit.object": "k = '" + AWS_KEY + "'\n"})
         self.assertIn("secret:aws_access_key", rules)
 
-    def test_the_task_commit_object_is_hash_checked_not_content_scanned(self):
-        # The fixture's commit object holds an author email; the task loads.
+    def test_an_author_email_in_the_commit_object_is_allowed(self):
+        # The fixture's commit object holds author and committer emails.
         self.assertEqual(len(self.fx.load()), 1)
+
+    TREE = "b" * 40
+    PERSON = "Example Author <author@example.invalid> 1790000000 +0000"
+
+    def object_findings(self, text, clients=frozenset({CLIENT})):
+        matcher = corpus_module._Matcher(("zz private term",), clients)
+        return {f.rule for f in corpus_module._commit_object_findings("commit.object", text.encode(), matcher)}
+
+    def valid(self, extra_headers="", message="Example commit\n", parents=""):
+        return (f"tree {self.TREE}\n{parents}author {self.PERSON}\ncommitter {self.PERSON}\n"
+                f"{extra_headers}\n{message}")
+
+    def test_a_well_formed_commit_object_has_no_findings(self):
+        self.assertEqual(self.object_findings(self.valid()), set())
+        self.assertEqual(self.object_findings(self.valid(parents=f"parent {'c' * 40}\nparent {'d' * 40}\n")), set())
+        gpg = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n"
+        self.assertEqual(self.object_findings(self.valid(extra_headers="encoding UTF-8\n" + gpg)), set())
+
+    def test_the_commit_object_format_is_strict(self):
+        for text in [
+            f"tree {self.TREE}\nanything at all\n\nmessage\n",
+            self.valid(extra_headers="unknown value\n"),
+            f"tree {self.TREE}\ncommitter {self.PERSON}\nauthor {self.PERSON}\n\nmessage\n",
+            f"tree {self.TREE}\nauthor {self.PERSON}\ncommitter {self.PERSON}\nparent {'c' * 40}\n\nmessage\n",
+            f"tree {self.TREE}\nauthor {self.PERSON}\ncommitter {self.PERSON}\n",
+            f"tree nothex\nauthor {self.PERSON}\ncommitter {self.PERSON}\n\nmessage\n",
+            self.valid(extra_headers=" orphan continuation\n"),
+        ]:
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.object_findings(text), {"sanitizer:commit_object_format"})
+
+    def test_extra_bytes_after_a_valid_tree_line_are_refused_in_the_load(self):
+        data = f"tree {self.TREE}\nnot a header\n\nmessage\n".encode()
+        commit = hashlib.sha1(b"commit " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        task_dir = self.fx.add_task("strict", commit=commit, tree=self.TREE)
+        (task_dir / "commit.object").write_bytes(data)
+        self.assertRefused("task strict: its own files failed the sanitizer")
+
+    def test_a_commit_object_over_64_kib_is_refused(self):
+        self.assertEqual(self.object_findings(self.valid(message="x" * (64 * 1024))),
+                         {"sanitizer:commit_object_too_large"})
+
+    def test_a_key_in_a_header_or_the_message_is_found(self):
+        self.assertIn("secret:aws_access_key", self.object_findings(self.valid(extra_headers="encoding " + AWS_KEY + "\n")))
+        self.assertIn("secret:aws_access_key", self.object_findings(self.valid(message="k = " + AWS_KEY + "\n")))
+        author_key = self.valid().replace("Example Author", "Example " + AWS_KEY)
+        self.assertIn("secret:aws_access_key", self.object_findings(author_key))
+
+    def test_a_client_name_in_the_message_or_a_header_is_found(self):
+        self.assertIn("sanitizer:client_repository",
+                      self.object_findings(self.valid(message="Port the client-site parser\n")))
+        mergetag = "mergetag object " + "c" * 40 + "\n type commit\n tag for client-site\n"
+        self.assertIn("sanitizer:client_repository", self.object_findings(self.valid(extra_headers=mergetag)))
+        self.assertIn("sanitizer:deny_term", self.object_findings(self.valid(message="zz private term\n")))
+
+    def test_author_and_committer_lines_get_the_secret_patterns_only(self):
+        person = self.valid().replace("Example Author", "Client Site")
+        self.assertEqual(self.object_findings(person), set())
+
+    def test_a_real_git_commit_object_passes_the_scan(self):
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        work = self.fx.root / "real-commit"
+        work.mkdir()
+        (work / "a.txt").write_text("a\n")
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=str(self.fx.root),
+                   GIT_AUTHOR_NAME="Example Author", GIT_AUTHOR_EMAIL="author@example.invalid",
+                   GIT_COMMITTER_NAME="Example Author", GIT_COMMITTER_EMAIL="author@example.invalid")
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "Example commit"]):
+            subprocess.run(["git", "-C", str(work), *args], check=True, env=env)
+        data = subprocess.run(["git", "-C", str(work), "cat-file", "commit", "HEAD"], check=True, env=env,
+                              capture_output=True).stdout
+        matcher = corpus_module._Matcher(("zz private term",), frozenset({CLIENT}))
+        self.assertEqual(corpus_module._commit_object_findings("commit.object", data, matcher), [])
+
+    def test_the_commit_object_is_hash_only_and_never_sent(self):
+        task = self.fx.load()[0]
+        entry = [e for e in task.task_manifest if e.path == "commit.object"][0]
+        self.assertTrue(entry.hash_only)
+        sent = [(root, e.path) for root, e in task.files_to_send()]
+        self.assertNotIn("commit.object", [path for _root, path in sent])
+        self.assertIn((task.prompt_path.parent, "prompt.md"), sent)
+        self.assertIn((task.snapshot_path, "src/parser.py"), sent)
+
+    def test_the_checked_commit_bytes_are_the_scanned_bytes(self):
+        real_read = corpus_module._read_regular
+        reads = []
+
+        def swap(path, cap):
+            data = real_read(path, cap)
+            if pathlib.Path(path).name == "commit.object":
+                reads.append(path)
+                if len(reads) > 1:  # the scan reads first; change what comes after
+                    return data + b"extra"
+            return data
+
+        with mock.patch.object(corpus_module, "_read_regular", side_effect=swap):
+            self.assertRefused("task parser-fix: the commit object changed after it was scanned")
 
 
 class ManifestTests(CorpusTestCase):

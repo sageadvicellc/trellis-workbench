@@ -24,8 +24,13 @@ model-fit bench" sets the rules this module enforces:
    not yet prove the commit belongs to the named repository: the corpus
    builder, which fetches from the allowlisted remote, will add that
    link. An empty snapshot, and a snapshot that holds git metadata, are
-   refused. commit.object holds author lines, so its name is scanned but
-   its content is only hash-checked; it is never sent to a provider.
+   refused. commit.object is parsed strictly as a git commit, at most
+   64 KiB: tree, parents, author, committer, then only the encoding,
+   gpgsig, and mergetag headers, a blank line, and the message. Every
+   line gets the full scan, except the author and committer lines, which
+   get the secret patterns only, because they hold names and emails by
+   design. Its manifest entry is marked hash-only, and it is never in the
+   set of files a sender may send.
 5. The sanitizer and a secret scan run on each task snapshot, on the
    task's own files, and on the task id, before it enters the corpus. A
    finding fails it. Both scan file contents and file and folder names.
@@ -80,6 +85,9 @@ _MAX_SCAN_BYTES = 5 * 1024 * 1024
 _MAX_NAMED_FINDINGS = 5
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
 _COMMIT_OBJECT = "commit.object"
+_MAX_COMMIT_OBJECT_BYTES = 64 * 1024
+_COMMIT_ID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+_OPTIONAL_COMMIT_HEADERS = ("encoding", "gpgsig", "mergetag")
 
 _B = r"(?<![A-Za-z0-9])"  # a key starts at a word boundary
 _SECRET_PATTERNS = {
@@ -142,6 +150,7 @@ class ManifestEntry:
     executable: bool = False
     blob_sha1: str = ""
     blob_sha256: str = ""
+    hash_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,6 +165,18 @@ class Task:
     task_manifest: tuple
     snapshot_path: Path
     snapshot_manifest: tuple
+
+    def files_to_send(self) -> tuple:
+        """The only files a sender may send: the snapshot's files and the
+        prompt, as (root, entry) pairs. A hash-only entry, such as the
+        commit object, is never in it."""
+        prompt = tuple(
+            (self.prompt_path.parent, entry)
+            for entry in self.task_manifest
+            if entry.path == self.prompt_path.name and not entry.hash_only
+        )
+        snapshot = tuple((self.snapshot_path, entry) for entry in self.snapshot_manifest if not entry.hash_only)
+        return prompt + snapshot
 
     def prompt_text(self) -> str:
         """The prompt, read once and decoded only if those bytes match the
@@ -292,6 +313,54 @@ def _secret_rules(text: str) -> list:
     return rules
 
 
+def _commit_object_findings(relative: str, data: bytes, matcher: _Matcher) -> list:
+    """Parse a raw commit object strictly and scan it. Any shape git does
+    not write is a finding."""
+    def bad():
+        return [Finding(relative, 0, "sanitizer:commit_object_format")]
+
+    if len(data) > _MAX_COMMIT_OBJECT_BYTES:
+        return [Finding(relative, 0, "sanitizer:commit_object_too_large")]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return [Finding(relative, 0, "sanitizer:not_utf8_text")]
+    header, separator, message = text.partition("\n\n")
+    if not separator:
+        return bad()
+    lines = header.split("\n")
+    index = 0
+    if not re.fullmatch(r"tree " + _COMMIT_ID, lines[0]):
+        return bad()
+    index = 1
+    while index < len(lines) and re.fullmatch(r"parent " + _COMMIT_ID, lines[index]):
+        index += 1
+    for field in ("author", "committer"):
+        if index >= len(lines) or not re.fullmatch(field + r" [^\n]+", lines[index]):
+            return bad()
+        index += 1
+    in_header = None
+    for line in lines[index:]:
+        if line.startswith(" ") and in_header in ("gpgsig", "mergetag"):
+            continue
+        name = line.split(" ", 1)[0]
+        if name not in _OPTIONAL_COMMIT_HEADERS or " " not in line:
+            return bad()
+        in_header = name
+
+    findings = []
+    for number, line in enumerate(lines, start=1):
+        if line.startswith(("author ", "committer ")):
+            rules = [rule for rule in _secret_rules(line) if rule.startswith("secret:")]
+        else:
+            rules = _secret_rules(line) + matcher.rules(line)
+        findings.extend(Finding(relative, number, rule) for rule in rules)
+    offset = len(lines) + 1
+    for finding in _scan_text(relative, message, matcher):
+        findings.append(Finding(relative, finding.line + offset, finding.rule))
+    return findings
+
+
 def _name_findings(relative: str, name: str, matcher: _Matcher) -> list:
     findings = [Finding(relative, 0, rule + "_in_path") for rule in matcher.rules(relative)]
     findings += [Finding(relative, 0, rule + "_in_path") for rule in _secret_rules(relative)]
@@ -390,6 +459,7 @@ def _scan(root: Path, matcher: _Matcher, hash_only: frozenset = frozenset()):
                 findings.append(Finding(relative, 0, data))
                 continue
             header = b"blob " + str(len(data)).encode() + b"\0"
+            is_hash_only = name in hash_only and Path(directory) == root
             manifest.append(ManifestEntry(
                 relative,
                 len(data),
@@ -397,9 +467,11 @@ def _scan(root: Path, matcher: _Matcher, hash_only: frozenset = frozenset()):
                 executable=bool(mode & stat.S_IXUSR),
                 blob_sha1=hashlib.sha1(header + data).hexdigest(),
                 blob_sha256=hashlib.sha256(header + data).hexdigest(),
+                hash_only=is_hash_only,
             ))
-            if name in hash_only and Path(directory) == root:
-                continue  # the commit object: author lines, hash-checked, never sent
+            if is_hash_only:
+                findings.extend(_commit_object_findings(relative, data, matcher))
+                continue
             if data.startswith(_LFS_POINTER_PREFIX):
                 findings.append(Finding(relative, 0, "sanitizer:lfs_pointer"))
             try:
@@ -422,7 +494,8 @@ def check_manifest(root: Path, manifest: tuple) -> None:
     """Prove the files under root are exactly the scanned ones, byte for
     byte, or raise CorpusRefused. Whatever sends a task calls this
     first."""
-    findings, current = _scan(root, _Matcher((), frozenset()))
+    hash_only = frozenset(entry.path for entry in manifest if entry.hash_only)
+    findings, current = _scan(root, _Matcher((), frozenset()), hash_only=hash_only)
     unreadable = [f for f in findings if not f.rule.startswith(("secret:", "sanitizer:email"))]
     if unreadable or current != tuple(manifest):
         raise CorpusRefused("the files changed after they were scanned")
@@ -563,9 +636,13 @@ def _load_task(task_dir: Path, allowed: dict, clients: frozenset, matcher: _Matc
         raise CorpusRefused(f"task {task_id}: {problem}") from None
     if snapshot_tree != tree:
         raise CorpusRefused(f"task {task_id}: the snapshot is not the recorded tree of that commit")
-    commit_object = _read_regular(task_dir / _COMMIT_OBJECT, _MAX_SCAN_BYTES)
-    if isinstance(commit_object, str) or _COMMIT_OBJECT not in {e.path for e in task_manifest}:
+    entry = next((e for e in task_manifest if e.path == _COMMIT_OBJECT and e.hash_only), None)
+    commit_object = _read_regular(task_dir / _COMMIT_OBJECT, _MAX_COMMIT_OBJECT_BYTES)
+    if entry is None or isinstance(commit_object, str):
         raise CorpusRefused(f"task {task_id}: the commit object is missing")
+    # The bytes checked here must be the bytes the scan read.
+    if len(commit_object) != entry.size or hashlib.sha256(commit_object).hexdigest() != entry.sha256:
+        raise CorpusRefused(f"task {task_id}: the commit object changed after it was scanned")
     try:
         verify_commit_object(commit_object, commit, tree)
     except CorpusRefused as problem:
