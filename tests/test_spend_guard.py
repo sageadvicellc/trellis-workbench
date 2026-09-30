@@ -146,6 +146,9 @@ def guarded(answer="yes", tty=True, out_tty=True, **overrides):
     args.update(overrides)
     if args["gpu"] is not None and "gpu_budget_seconds" not in overrides:
         args["gpu_budget_seconds"] = 60
+    if args["gpu"] is not None and "gpu_call_timeout_s" not in overrides:
+        args["gpu_call_timeout_s"] = 5
+    args.setdefault("gpu_call_timeout_s", None)
     read = mock.Mock(return_value=answer) if isinstance(answer, str) else mock.Mock(side_effect=answer)
     with mock.patch.object(spend_guard, "_stdin_is_tty", return_value=tty), \
             mock.patch.object(spend_guard, "_out_is_tty", return_value=out_tty), \
@@ -258,7 +261,7 @@ class ApprovalTests(unittest.TestCase):
             {
                 "estimate", "token_price", "cap_micros", "max_tokens_per_request",
                 "request_timeout_s", "run_time_limit_s", "requests", "endpoint",
-                "out", "gpu", "gpu_budget_seconds",
+                "out", "gpu", "gpu_budget_seconds", "gpu_call_timeout_s",
             },
         )
 
@@ -452,6 +455,51 @@ class TimeAndGpuTests(unittest.TestCase):
                     guarded(gpu=gpu, gpu_budget_seconds=budget)
         with self.assertRaises(ValueError):
             guarded(gpu_budget_seconds=60)
+        with self.assertRaises(ValueError):
+            guarded(gpu_call_timeout_s=5)
+        with self.assertRaises(ValueError):
+            guarded(gpu=StubGpu(), gpu_call_timeout_s=0)
+
+    def test_a_hanging_gpu_start_times_out_and_is_torn_down(self):
+        class HangingStartGpu(StubGpu):
+            def __init__(self):
+                super().__init__()
+                self.release = threading.Event()
+
+            def start(self):
+                self.started += 1
+                self.release.wait(5)
+
+        gpu = HangingStartGpu()
+        try:
+            args, result = guarded(gpu=gpu, gpu_call_timeout_s=0.05)
+        finally:
+            gpu.release.set()
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertIn("start timed out", result.reason)
+        self.assertEqual(gpu.torn_down, 1)
+        self.assertEqual(args["endpoint"].calls, [])
+
+    def test_a_hanging_teardown_counts_as_unconfirmed(self):
+        class HangingTeardownGpu(StubGpu):
+            def __init__(self):
+                super().__init__()
+                self.release = threading.Event()
+
+            def teardown(self):
+                self.torn_down += 1
+                self.release.wait(5)
+                return True
+
+        gpu = HangingTeardownGpu()
+        try:
+            _args, result = guarded(gpu=gpu, gpu_call_timeout_s=0.05)
+        finally:
+            gpu.release.set()
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertFalse(result.teardown_confirmed)
+        self.assertIn("teardown", result.reason)
+        self.assertIn("the GPU teardown timed out", result.notes)
 
 
 class TeardownTests(unittest.TestCase):
@@ -556,6 +604,44 @@ class InterruptTests(unittest.TestCase):
     @unittest.skipUnless(hasattr(signal, "SIGHUP"), "no SIGHUP here")
     def test_sighup_tears_down_and_restores_the_handler(self):
         self._signal_test(signal.SIGHUP)
+
+    def test_a_second_signal_during_teardown_does_not_stop_it(self):
+        before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+
+        class SignalledGpu(StubGpu):
+            def teardown(self):
+                self.torn_down += 1
+                os.kill(os.getpid(), signal.SIGTERM)
+                os.kill(os.getpid(), signal.SIGINT)
+                threading.Event().wait(0.05)
+                return True
+
+        gpu = SignalledGpu()
+        endpoint = HangingEndpoint(before=lambda: os.kill(os.getpid(), signal.SIGTERM))
+        try:
+            with self.assertRaises(Terminated) as ctx:
+                guarded(endpoint=endpoint, gpu=gpu)
+        finally:
+            endpoint.release.set()
+        result = ctx.exception.run_result
+        self.assertTrue(result.teardown_confirmed)
+        self.assertEqual(gpu.torn_down, 1)
+        self.assertEqual({s: signal.getsignal(s) for s in before}, before)
+
+    def test_a_sigint_during_teardown_is_held_until_it_finishes(self):
+        class SignalledGpu(StubGpu):
+            def teardown(self):
+                self.torn_down += 1
+                os.kill(os.getpid(), signal.SIGINT)
+                threading.Event().wait(0.05)
+                return True
+
+        gpu = SignalledGpu()
+        with self.assertRaises(KeyboardInterrupt) as ctx:
+            guarded(gpu=gpu)
+        result = ctx.exception.run_result
+        self.assertTrue(result.teardown_confirmed)
+        self.assertIn("a SIGINT during cleanup was held until the teardown finished", result.notes)
 
     def test_the_handlers_are_restored_after_a_normal_run(self):
         before = signal.getsignal(signal.SIGTERM)

@@ -24,6 +24,16 @@ sageadvicellc/workbench:
    be caught, so every GPU also needs a provider-side time-to-live or
    auto-stop as the backstop.
 
+The GPU lease's start() and teardown() run under a timeout too, so a
+hung provider call cannot block the guard while GPU time runs. A
+teardown that times out counts as unconfirmed, and the run fails.
+During cleanup, SIGTERM and SIGHUP are ignored and SIGINT is held until
+teardown finishes, so a second signal cannot stop the teardown.
+
+A request, start, or teardown that times out keeps running on its worker
+thread. Repeated run_guarded calls in one process can leave such orphan
+threads, so an endpoint or GPU client must tolerate a late call.
+
 The endpoint contract. The guard calls the endpoint once per request.
 The endpoint passes request.max_tokens to the provider as its output
 limit and reports it back as max_tokens_sent. It makes exactly one
@@ -182,6 +192,10 @@ class Terminated(BaseException):
     """SIGTERM or SIGHUP arrived during a run."""
 
 
+class CallTimedOut(Exception):
+    """A GPU start or teardown ran past its timeout."""
+
+
 class SpendTally:
     """The running tally for one run, against its hard cap.
 
@@ -320,31 +334,39 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
-def _call_with_timeout(endpoint, request: Request, timeout_s: float, run_limited: bool) -> Response:
-    """Call the endpoint on a worker thread and wait at most timeout_s.
+def _run_with_timeout(call, timeout_s: float, on_timeout: BaseException):
+    """Run call() on a worker thread and wait at most timeout_s.
 
-    A request that times out keeps running on its thread, which is why
-    the GPU is torn down at once and the request is charged at its
-    reservation.
+    A call that times out keeps running on its thread; the guard raises
+    on_timeout and moves on.
     """
     box = {}
 
     def work():
         try:
-            box["response"] = endpoint(request)
+            box["value"] = call()
         except BaseException as error:  # noqa: BLE001 -- handed back to the caller
             box["error"] = error
 
-    worker = threading.Thread(target=work, name="spend-guard-request", daemon=True)
+    worker = threading.Thread(target=work, name="spend-guard-call", daemon=True)
     worker.start()
     worker.join(timeout_s)
     if worker.is_alive():
-        if run_limited:
-            raise RunTimeLimitReached("the run reached its wall-clock limit")
-        raise RequestTimedOut("a request ran past its timeout")
+        raise on_timeout
     if "error" in box:
         raise box["error"]
-    return box["response"]
+    return box["value"]
+
+
+def _call_with_timeout(endpoint, request: Request, timeout_s: float, run_limited: bool) -> Response:
+    """Call the endpoint under a timeout. A request that times out is
+    charged at its reservation, and the GPU is torn down at once."""
+    on_timeout = (
+        RunTimeLimitReached("the run reached its wall-clock limit")
+        if run_limited
+        else RequestTimedOut("a request ran past its timeout")
+    )
+    return _run_with_timeout(lambda: endpoint(request), timeout_s, on_timeout)
 
 
 def _raise_terminated(signum, _frame):
@@ -366,6 +388,21 @@ def _restore_signal_handlers(previous: dict) -> None:
         signal.signal(signum, handler)
 
 
+def _shield_cleanup(run_handlers: dict):
+    """For cleanup: ignore SIGTERM and SIGHUP, and hold SIGINT until the
+    teardown is done. Returns the handlers to restore after, and the list
+    that records a held SIGINT."""
+    restore = {}
+    held = []
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            current = signal.signal(signum, signal.SIG_IGN)
+            restore[signum] = run_handlers.get(signum, current)
+    restore[signal.SIGINT] = signal.signal(signal.SIGINT, lambda signum, _frame: held.append(signum))
+    return restore, held
+
+
 def run_guarded(
     *,
     estimate: Estimate,
@@ -379,6 +416,7 @@ def run_guarded(
     out: TextIO,
     gpu: Optional[GpuLease],
     gpu_budget_seconds: Optional[int],
+    gpu_call_timeout_s: Optional[float],
 ) -> RunResult:
     """Print the estimate, get the founder's yes, then run the requests
     under the hard cap and tear down any GPU.
@@ -401,9 +439,11 @@ def run_guarded(
             raise ValueError("a GPU lease needs a whole price_per_second_micros of 0 or more")
         if not _is_whole(gpu_budget_seconds) or gpu_budget_seconds < 1:
             raise ValueError("a run with a GPU needs a whole gpu_budget_seconds of 1 or more")
+        if not _is_positive_number(gpu_call_timeout_s):
+            raise ValueError("a run with a GPU needs a positive gpu_call_timeout_s")
         gpu_hold = gpu_budget_seconds * gpu_price
-    elif gpu_budget_seconds is not None:
-        raise ValueError("gpu_budget_seconds is only for a run with a GPU")
+    elif gpu_budget_seconds is not None or gpu_call_timeout_s is not None:
+        raise ValueError("gpu_budget_seconds and gpu_call_timeout_s are only for a run with a GPU")
 
     planned = list(requests)
     result = RunResult(status=RunStatus.REFUSED, reason="", cap_micros=cap_micros, estimate=estimate)
@@ -453,14 +493,15 @@ def run_guarded(
         run_limit_s = min(run_time_limit_s, float(gpu_budget_seconds))
     pending = None
     interrupted = None
-    previous_handlers = _install_signal_handlers()
+    previous_handlers = {}
     try:
+        previous_handlers = _install_signal_handlers()
         started_at = _monotonic()
         deadline = started_at + run_limit_s
         if gpu is not None:
             tally.hold(gpu_hold)
             gpu_started_at = _monotonic()
-            gpu.start()
+            _run_with_timeout(gpu.start, gpu_call_timeout_s, CallTimedOut("the GPU start timed out"))
         for request in planned:
             bound = tally.bound(request, token_price)
             tally.reserve(bound)
@@ -468,17 +509,20 @@ def run_guarded(
             if remaining <= 0:
                 raise RunTimeLimitReached("the run reached its wall-clock limit")
             timeout = min(request_timeout_s, remaining)
-            pending = (request, bound)
+            pending = (request, bound, tally.spent_micros)
             response = _call_with_timeout(endpoint, request, timeout, run_limited=timeout < request_timeout_s)
             result.requests_sent += 1
-            pending = None
             tally.settle(request, bound, response, token_price)
+            pending = None
     except (TokenCeilingExceeded, CapReached) as stop:
         result.status = RunStatus.STOPPED_AT_CAP
         result.reason = f"stopped at the cap: {stop}"
     except (CostUnknown, ContractBroken) as broken:
         result.status = RunStatus.FAILED
         result.reason = f"the run failed: {broken}"
+    except CallTimedOut as timed_out:
+        result.status = RunStatus.FAILED
+        result.reason = f"the run failed: {timed_out}"
     except Exception as error:  # noqa: BLE001 -- any endpoint or GPU fault fails the run
         result.status = RunStatus.FAILED
         result.reason = f"the run failed with {type(error).__name__}"
@@ -487,15 +531,22 @@ def run_guarded(
         result.reason = f"interrupted by {type(error).__name__}"
         interrupted = error
     finally:
+        restore_handlers, held_sigint = _shield_cleanup(previous_handlers)
         try:
-            if pending is not None:
-                # A request that was sent but not settled may still be
+            if pending is not None and tally.spent_micros == pending[2]:
+                # A request that was sent but not charged may still be
                 # billed, so it counts at its full reservation.
                 tally.charge(pending[1])
                 result.notes.append("a request in flight was counted at its reservation")
             if gpu is not None and gpu_started_at is not None:
                 try:
-                    result.teardown_confirmed = gpu.teardown() is True
+                    confirmed = _run_with_timeout(
+                        gpu.teardown, gpu_call_timeout_s, CallTimedOut("the GPU teardown timed out")
+                    )
+                    result.teardown_confirmed = confirmed is True
+                except CallTimedOut:
+                    result.teardown_confirmed = False
+                    result.notes.append("the GPU teardown timed out")
                 except BaseException as error:  # noqa: BLE001 -- a failed teardown is a failed run
                     result.teardown_confirmed = False
                     result.notes.append(f"teardown raised {type(error).__name__}")
@@ -510,7 +561,10 @@ def run_guarded(
                     result.status = RunStatus.STOPPED_AT_CAP
                     result.reason = "the GPU time passed the hard cap"
         finally:
-            _restore_signal_handlers(previous_handlers)
+            _restore_signal_handlers(restore_handlers)
+            if held_sigint and interrupted is None:
+                interrupted = KeyboardInterrupt()
+                result.notes.append("a SIGINT during cleanup was held until the teardown finished")
             result.spent_micros = tally.spent_micros
             out.write(
                 f"Run {result.status.value}: {result.reason}."
