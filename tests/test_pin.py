@@ -15,24 +15,36 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from bench.pin import (  # noqa: E402
     PIN_FIELDS,
     PinInvalid,
+    PinMismatch,
     RunPin,
     prompt_sha256,
     require_pin,
+    verify_pin,
 )
 
 HARNESS = "a" * 40
 CORPUS = "b" * 40
+REVISION = "c" * 40
+NUMERIC_FIELDS = {"seed", "temperature", "top_p", "max_output_tokens"}
+WEIGHTS = "d" * 64
 PROMPT_TEXT = "Fix the failing test in the parser module."
 # The digest of the pin fields() builds, frozen so a change to the record's
 # key order, separators, or schema shows up as a failure.
-GOLDEN_DIGEST = "7ebe49229659e9baa0a019d422b41cee70583fea7cd5a2f16dcf39cd4bcb0950"
+GOLDEN_DIGEST = "e828a34b93ec85cea1c3042e457029ed186e771149c00ed6576be7aad3ae69e8"
 
 
 def fields(**overrides):
     base = {
         "model_id": "claude-opus-5-5",
-        "model_version": "2026-09-01",
+        "model_version": REVISION,
+        "weights_sha256": WEIGHTS,
         "quantization": "none",
+        "runtime_name": "vllm",
+        "runtime_version": "0.6.3",
+        "client_version": "1.51.0",
+        "temperature": 0,
+        "top_p": 1,
+        "max_output_tokens": 4096,
         "prompt_id": "tasks/parser-fix/prompt.md",
         "prompt_sha256": prompt_sha256(PROMPT_TEXT),
         "seed": 42,
@@ -77,13 +89,9 @@ class CompletePinTests(unittest.TestCase):
 
     def test_the_record_and_digest_do_not_drift(self):
         pin = require_pin(fields())
-        self.assertEqual(
-            pin.record_json(),
-            '{"corpus_commit":"' + CORPUS + '","harness_commit":"' + HARNESS + '",'
-            '"model_id":"claude-opus-5-5","model_version":"2026-09-01",'
-            '"prompt_id":"tasks/parser-fix/prompt.md","prompt_sha256":"' + prompt_sha256(PROMPT_TEXT) + '",'
-            '"quantization":"none","schema":1,"seed":42}',
-        )
+        record_json = pin.record_json()
+        self.assertTrue(record_json.startswith('{"client_version":"1.51.0","corpus_commit":"'))
+        self.assertTrue(record_json.endswith('"temperature":0,"top_p":1,"weights_sha256":"' + WEIGHTS + '"}'))
         self.assertEqual(pin.digest(), GOLDEN_DIGEST)
 
     def test_the_record_is_canonical_json(self):
@@ -96,7 +104,10 @@ class CompletePinTests(unittest.TestCase):
             ("model_id", "qwen/qwen3-coder:free"),
             ("model_id", "llama3.1:8b"),
             ("model_id", "hf.co/org/model:Q4_K_M"),
-            ("model_version", "1.0+build5"),
+            ("model_version", "e" * 64),
+            ("runtime_version", "1.0+build5"),
+            ("temperature", 0.7),
+            ("top_p", 0.95),
             ("quantization", "q4_k_m"),
             ("quantization", "Q4_K_M"),
             ("quantization", "IQ4_XS"),
@@ -158,7 +169,7 @@ class MissingOrBadTests(unittest.TestCase):
 
     def test_non_string_values_are_refused(self):
         for name in PIN_FIELDS:
-            if name == "seed":
+            if name in NUMERIC_FIELDS:
                 continue
             for value in [5, ["tasks/x.md"], b"abc"]:
                 with self.subTest(field=name, value=value):
@@ -207,12 +218,14 @@ class MissingOrBadTests(unittest.TestCase):
                 self.assertEqual(str(ctx.exception), "1 field(s) that are not pin fields")
 
     def test_a_credential_shaped_value_is_refused_and_never_echoed(self):
+        # Built from pieces, so no whole key-shaped string sits in the source.
+        mixed_run = "Zk3x9Qw" + "ErTyUiOp" + "AsDfGhJk2"
         for name, value in [
-            ("model_id", "sk-ant-api03-Zk3x9QwErTyUiOpAsDfGhJk"),
-            ("model_version", "ghp_1A2b3C4d5E6f7G8h9I0j"),
-            ("model_version", "AKIAIOSFODNN7EXAMPLE"),
-            ("quantization", "eyjhbgcioijiuzi1nij9"),
-            ("prompt_id", "tasks/Zk3x9QwErTyUiOpAsDfGhJk2/prompt.md"),
+            ("model_id", "sk" + "-ant-" + "api03-" + mixed_run),
+            ("runtime_version", "gh" + "p_" + "1A2b3C4d5E6f7G8h9I0j"),
+            ("client_version", "AK" + "IA" + "IOSFODNN7EXAMPLE"),
+            ("quantization", "ey" + "j" + "hbgcioijiuzi1nij9"),
+            ("prompt_id", "tasks/" + mixed_run + "/prompt.md"),
         ]:
             with self.subTest(field=name, value=value):
                 with self.assertRaises(PinInvalid) as ctx:
@@ -224,6 +237,27 @@ class MissingOrBadTests(unittest.TestCase):
         for model_id in ["Meta-Llama-3.1-70B-Instruct", "claude-3-5-sonnet-20241022", "gpt-4.1-mini"]:
             with self.subTest(model_id=model_id):
                 require_pin(fields(model_id=model_id))
+
+    def test_a_moving_model_version_is_refused(self):
+        for value in ["latest", "LATEST", "main", "Master", "HEAD", "2026-09-01", "v1.0"]:
+            with self.subTest(value=value):
+                with self.assertRaises(PinInvalid) as ctx:
+                    require_pin(fields(model_version=value))
+                self.assertIn("model_version", str(ctx.exception))
+
+    def test_the_weights_digest_is_required(self):
+        for value in [None, "", "d" * 63, "D" * 64, "latest"]:
+            with self.subTest(value=value):
+                with self.assertRaises(PinInvalid):
+                    require_pin(fields(weights_sha256=value))
+
+    def test_sampling_settings_are_bounded(self):
+        for name, value in [("temperature", -0.1), ("temperature", 2.1), ("temperature", float("nan")),
+                            ("temperature", True), ("top_p", 0), ("top_p", 1.1), ("top_p", "1"),
+                            ("max_output_tokens", 0), ("max_output_tokens", 1.5), ("max_output_tokens", True)]:
+            with self.subTest(field=name, value=value):
+                with self.assertRaises(PinInvalid):
+                    require_pin(fields(**{name: value}))
 
     def test_a_non_mapping_is_refused(self):
         for value in [None, [], ["model_id"], "model_id"]:
@@ -260,3 +294,31 @@ class MissingOrBadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyPinTests(unittest.TestCase):
+    def setUp(self):
+        self.pin = require_pin(fields())
+
+    def test_a_pin_that_matches_the_disk_passes(self):
+        verify_pin(self.pin, HARNESS, CORPUS, PROMPT_TEXT, WEIGHTS)
+
+    def test_each_mismatch_is_named(self):
+        for name, args in [
+            ("harness_commit", ("e" * 40, CORPUS, PROMPT_TEXT, WEIGHTS)),
+            ("corpus_commit", (HARNESS, "e" * 40, PROMPT_TEXT, WEIGHTS)),
+            ("prompt_sha256", (HARNESS, CORPUS, PROMPT_TEXT + "!", WEIGHTS)),
+            ("weights_sha256", (HARNESS, CORPUS, PROMPT_TEXT, "e" * 64)),
+        ]:
+            with self.subTest(field=name):
+                with self.assertRaises(PinMismatch) as ctx:
+                    verify_pin(self.pin, *args)
+                self.assertEqual(str(ctx.exception), f"the pin does not match what is on disk: ['{name}']")
+
+    def test_an_empty_prompt_is_a_mismatch_not_a_crash(self):
+        with self.assertRaises(PinMismatch):
+            verify_pin(self.pin, HARNESS, CORPUS, "", WEIGHTS)
+
+    def test_no_pin_is_a_mismatch(self):
+        with self.assertRaises(PinMismatch):
+            verify_pin(None, HARNESS, CORPUS, PROMPT_TEXT, WEIGHTS)
