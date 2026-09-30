@@ -224,7 +224,8 @@ class EgressProxy:
             do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _forward
 
         self._server = _Server(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, name="egress-proxy", daemon=True)
+        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05},
+                                        name="egress-proxy", daemon=True)
         self._thread.start()
         return self.url
 

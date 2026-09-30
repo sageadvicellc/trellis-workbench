@@ -124,6 +124,26 @@ report(started=True)
 time.sleep(30)
 """
 
+REWRITE_GITFILE_BODY = """
+# Point the gitfile at the source repository's own .git folder, a real
+# repository, so git still sees this folder as a worktree top.
+admin = pathlib.Path(pathlib.Path(".git").read_text().split("gitdir: ", 1)[1].strip())
+pathlib.Path(".git").write_text("gitdir: " + str(admin.parent.parent) + "\\n")
+pathlib.Path("answer.txt").write_text("42\\n")
+report(started=True)
+"""
+
+TUNNEL_BODY = """
+proxy = urllib.parse.urlsplit(os.environ["HTTPS_PROXY"])
+endpoint = urllib.parse.urlsplit(ENDPOINT)
+conn = http.client.HTTPConnection(proxy.hostname, proxy.port, timeout=10)
+conn.set_tunnel(endpoint.hostname, endpoint.port)
+conn.request("POST", "/v1/chat/completions", body=b"{}")
+answer = json.load(conn.getresponse())
+pathlib.Path("answer.txt").write_text(answer["choices"][0]["message"]["content"] + "\\n")
+report(started=True)
+"""
+
 PLANT_NESTED_BODY = """
 pathlib.Path("vendor/.git").mkdir(parents=True)
 pathlib.Path("answer.txt").write_text("42\\n")
@@ -337,6 +357,21 @@ class PassTests(ReplayTestCase):
         self.assertEqual(result.record["egress"]["endpoint"], f"[::1]:{self.fx.endpoint.port}")
 
 
+class TunnelTests(ReplayTestCase):
+    def test_a_run_through_a_tunnel_has_unknown_tokens_and_the_spend_guard_fails_it(self):
+        self.fx.write_harness(TUNNEL_BODY)
+        result, _ = self.fx.run()
+        self.assertEqual(len(self.fx.endpoint.requests), 1)
+        self.assertEqual(result.record["gate"]["result"], "pass")
+        self.assertFalse(result.record["tokens"]["known"])
+        self.assertIsNone(result.record["tokens"]["input"])
+        self.assertIn("tunnel", result.record["tokens"]["reason"])
+        self.assertEqual(result.spend.status, RunStatus.FAILED)
+        self.assertEqual(result.record["outcome"], "error")
+        self.assertEqual(result.record["egress"]["tunnels"], 1)
+        self.assertCleanedUp()
+
+
 class FailTests(ReplayTestCase):
     def test_a_change_that_fails_the_gate_records_fail_with_its_exit_code(self):
         self.fx.write_harness(FAIL_BODY)
@@ -482,6 +517,15 @@ class GuardRefusalTests(ReplayTestCase):
         result, _ = self.fx.run()
         self.assertEqual(result.record["outcome"], "refused")
         self.assertIn("another git repository", result.record["reason"])
+        self.assertIsNone(result.record["gate"])
+        self.assertCleanedUp()
+
+    def test_a_gitfile_rewritten_by_the_harness_refuses_the_gate(self):
+        self.fx.write_harness(REWRITE_GITFILE_BODY)
+        result, _ = self.fx.run()
+        self.assertTrue(self.fx.harness_report()["started"])
+        self.assertEqual(result.record["outcome"], "refused")
+        self.assertIn(".git", result.record["reason"])
         self.assertIsNone(result.record["gate"])
         self.assertCleanedUp()
 
