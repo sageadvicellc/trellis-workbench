@@ -8,11 +8,25 @@ the corpus commit. The pin also records the weights digest, the runtime
 and client library versions, and the sampling settings. A run missing
 any of them is not counted, so require_pin fails before the run starts.
 
-model_version is a 40-hex revision or a 64-hex digest, never a moving
-name such as latest or main, and weights_sha256 is the SHA-256 of the
-weights file or the runtime's manifest digest. verify_pin checks a pin
-against what is actually on disk; the replay harness (bench item 3,
-trellis-workbench#6) calls it before the spend guard.
+weights_kind says what the model's identity rests on:
+
+- file: model_version is a 40-hex revision or a 64-hex digest, never a
+  moving name such as latest or main, and weights_sha256 is the SHA-256
+  of the weights file.
+- manifest: the same, with weights_sha256 the runtime's manifest digest.
+- provider_snapshot: a hosted model with no file to hash. model_id is
+  the provider's full dated snapshot id, the provider is runtime_name,
+  and model_version and weights_sha256 are both the SHA-256 of the text
+  "<provider>|<snapshot id>". A model with no dated snapshot id cannot be
+  pinned, so its runs do not count.
+
+Runs of different weights_kind never compare as equal: the kind is part
+of the record and its digest. temperature and top_p are recorded as
+floats, so 0, 0.0, and -0.0 give one record.
+
+verify_pin checks a pin against what is actually on disk; the replay
+harness (bench item 3, trellis-workbench#6) calls it before the spend
+guard.
 
 The record holds the prompt's id in the corpus and the SHA-256 of its
 text, never the text. The corpus commit plus the prompt id recovers the
@@ -42,6 +56,7 @@ PIN_FIELDS = (
     "model_id",
     "model_version",
     "weights_sha256",
+    "weights_kind",
     "quantization",
     "runtime_name",
     "runtime_version",
@@ -57,6 +72,10 @@ PIN_FIELDS = (
 )
 
 _MOVING_VERSION_NAMES = frozenset({"latest", "main", "master", "head"})
+WEIGHTS_KINDS = ("file", "manifest", "provider_snapshot")
+# A dated snapshot id carries a calendar date, such as 20241022 or
+# 2024-08-06.
+_SNAPSHOT_DATE_RE = re.compile(r"(?<![0-9])(?:19|20)[0-9]{2}-?(?:0[1-9]|1[0-2])-?(?:0[1-9]|[12][0-9]|3[01])(?![0-9])")
 
 # Up to three parts split by `/`, such as a host, an organization, and a
 # model with a `:tag` (an Ollama tag or a quantization suffix).
@@ -141,6 +160,7 @@ _CHECKS = {
     "model_id": _matches(_MODEL_ID_RE),
     "model_version": _is_model_version,
     "weights_sha256": _matches(_SHA256_RE),
+    "weights_kind": lambda value: value in WEIGHTS_KINDS,
     "runtime_name": _matches(_RUNTIME_NAME_RE),
     "runtime_version": _matches(_SOFTWARE_VERSION_RE),
     "client_version": _matches(_SOFTWARE_VERSION_RE),
@@ -154,6 +174,12 @@ _CHECKS = {
     "harness_commit": _matches(_COMMIT_RE),
     "corpus_commit": _matches(_COMMIT_RE),
 }
+
+
+def provider_snapshot_digest(provider: str, snapshot_id: str) -> str:
+    """model_version and weights_sha256 for a provider_snapshot pin: the
+    SHA-256 of "<provider>|<snapshot id>"."""
+    return hashlib.sha256(f"{provider}|{snapshot_id}".encode("utf-8")).hexdigest()
 
 
 def prompt_sha256(prompt_text: str) -> str:
@@ -172,6 +198,7 @@ class RunPin:
     model_id: str
     model_version: str
     weights_sha256: str
+    weights_kind: str
     quantization: str
     runtime_name: str
     runtime_version: str
@@ -192,10 +219,22 @@ class RunPin:
         bad = [name for name in PIN_FIELDS if not _CHECKS[name](getattr(self, name))]
         if bad:
             raise PinInvalid(f"pin fields with a value of the wrong shape: {bad}")
+        if self.weights_kind == "provider_snapshot":
+            if not _SNAPSHOT_DATE_RE.search(self.model_id):
+                raise PinInvalid("a provider_snapshot pin needs a dated snapshot id in model_id")
+            expected = provider_snapshot_digest(self.runtime_name, self.model_id)
+            wrong = [name for name in ("model_version", "weights_sha256") if getattr(self, name) != expected]
+            if wrong:
+                raise PinInvalid(f"pin fields that do not match the provider snapshot: {wrong}")
 
     def record(self) -> dict:
-        """The run's pin record: the schema version and every pin field."""
-        return {"schema": SCHEMA, **asdict(self)}
+        """The run's pin record: the schema version and every pin field,
+        with temperature and top_p as floats so equal settings give equal
+        text."""
+        record = {"schema": SCHEMA, **asdict(self)}
+        for name in ("temperature", "top_p"):
+            record[name] = float(record[name]) + 0.0
+        return record
 
     def record_json(self) -> str:
         """The record as canonical JSON, so equal pins give equal text."""
@@ -225,13 +264,23 @@ def require_pin(fields: dict) -> RunPin:
     return RunPin(**{name: fields[name] for name in PIN_FIELDS})
 
 
-def verify_pin(pin: RunPin, harness_head: str, corpus_head: str, prompt_text: str, weights_digest: str) -> None:
+def verify_pin(
+    pin: RunPin,
+    harness_head: str,
+    corpus_head: str,
+    prompt_text: str,
+    weights_digest: str,
+    model_version: str,
+    runtime_version: str,
+    client_version: str,
+) -> None:
     """Check a pin against what is actually on disk, or raise PinMismatch
     naming each field that differs.
 
     Pure: it reads nothing itself. The replay harness (bench item 3,
     trellis-workbench#6) reads the harness and corpus heads, the prompt
-    file at the corpus commit, and the weights digest, then calls this
+    file at the corpus commit, the weights digest, the model version, and
+    the runtime and client versions in use, then calls this
     before it calls the spend guard, so a run never spends on inputs
     that differ from its pin.
     """
@@ -248,6 +297,9 @@ def verify_pin(pin: RunPin, harness_head: str, corpus_head: str, prompt_text: st
             ("corpus_commit", corpus_head),
             ("prompt_sha256", prompt_digest),
             ("weights_sha256", weights_digest),
+            ("model_version", model_version),
+            ("runtime_version", runtime_version),
+            ("client_version", client_version),
         )
         if getattr(pin, name) != actual
     ]

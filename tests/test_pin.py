@@ -18,6 +18,7 @@ from bench.pin import (  # noqa: E402
     PinMismatch,
     RunPin,
     prompt_sha256,
+    provider_snapshot_digest,
     require_pin,
     verify_pin,
 )
@@ -25,21 +26,27 @@ from bench.pin import (  # noqa: E402
 HARNESS = "a" * 40
 CORPUS = "b" * 40
 REVISION = "c" * 40
+PROVIDER = "example-provider"
+SNAPSHOT = "example-model-20260930"
+SNAPSHOT_DIGEST = provider_snapshot_digest(PROVIDER, SNAPSHOT)
 NUMERIC_FIELDS = {"seed", "temperature", "top_p", "max_output_tokens"}
 WEIGHTS = "d" * 64
 PROMPT_TEXT = "Fix the failing test in the parser module."
 # The digest of the pin fields() builds, frozen so a change to the record's
 # key order, separators, or schema shows up as a failure.
-GOLDEN_DIGEST = "e828a34b93ec85cea1c3042e457029ed186e771149c00ed6576be7aad3ae69e8"
+GOLDEN_DIGEST = "e8527cf56cc016c53b80d424388bf4d105e57a453a2e451dddbe31d46b38ea2f"
 
 
 def fields(**overrides):
+    """An honest hosted-model pin: a provider_snapshot whose version and
+    weights digest are the SHA-256 of "<provider>|<snapshot id>"."""
     base = {
-        "model_id": "claude-opus-5-5",
-        "model_version": REVISION,
-        "weights_sha256": WEIGHTS,
+        "model_id": SNAPSHOT,
+        "model_version": SNAPSHOT_DIGEST,
+        "weights_sha256": SNAPSHOT_DIGEST,
+        "weights_kind": "provider_snapshot",
         "quantization": "none",
-        "runtime_name": "vllm",
+        "runtime_name": PROVIDER,
         "runtime_version": "0.6.3",
         "client_version": "1.51.0",
         "temperature": 0,
@@ -55,12 +62,20 @@ def fields(**overrides):
     return base
 
 
+def file_fields(**overrides):
+    """A local-weights pin: a fixed revision and the weights file digest."""
+    base = fields(weights_kind="file", model_id="org/local-model", model_version=REVISION,
+                  weights_sha256=WEIGHTS, runtime_name="vllm")
+    base.update(overrides)
+    return base
+
+
 class CompletePinTests(unittest.TestCase):
     def test_a_complete_pin_records_every_field(self):
         pin = require_pin(fields())
         record = pin.record()
         self.assertEqual(set(record), set(PIN_FIELDS) | {"schema"})
-        self.assertEqual(record["model_id"], "claude-opus-5-5")
+        self.assertEqual(record["model_id"], SNAPSHOT)
         self.assertEqual(record["seed"], 42)
         self.assertEqual(record["harness_commit"], HARNESS)
 
@@ -91,7 +106,10 @@ class CompletePinTests(unittest.TestCase):
         pin = require_pin(fields())
         record_json = pin.record_json()
         self.assertTrue(record_json.startswith('{"client_version":"1.51.0","corpus_commit":"'))
-        self.assertTrue(record_json.endswith('"temperature":0,"top_p":1,"weights_sha256":"' + WEIGHTS + '"}'))
+        self.assertTrue(record_json.endswith(
+            '"temperature":0.0,"top_p":1.0,"weights_kind":"provider_snapshot","weights_sha256":"'
+            + SNAPSHOT_DIGEST + '"}'
+        ))
         self.assertEqual(pin.digest(), GOLDEN_DIGEST)
 
     def test_the_record_is_canonical_json(self):
@@ -105,6 +123,7 @@ class CompletePinTests(unittest.TestCase):
             ("model_id", "llama3.1:8b"),
             ("model_id", "hf.co/org/model:Q4_K_M"),
             ("model_version", "e" * 64),
+            ("weights_kind", "manifest"),
             ("runtime_version", "1.0+build5"),
             ("temperature", 0.7),
             ("top_p", 0.95),
@@ -117,7 +136,7 @@ class CompletePinTests(unittest.TestCase):
             ("harness_commit", "0123456789abcdef" * 4),
         ]:
             with self.subTest(field=name, value=value):
-                require_pin(fields(**{name: value}))
+                require_pin(file_fields(**{name: value}))
 
 
 class MissingOrBadTests(unittest.TestCase):
@@ -177,7 +196,7 @@ class MissingOrBadTests(unittest.TestCase):
                         require_pin(fields(**{name: value}))
 
     def test_length_bounds(self):
-        require_pin(fields(model_id="m" * 128))
+        require_pin(file_fields(model_id="m" * 128))
         require_pin(fields(prompt_id="p" * 256))
         for name, value in [("model_id", "m" * 129), ("prompt_id", "p" * 257),
                             ("model_version", "v" * 65), ("quantization", "q" * 33)]:
@@ -236,13 +255,13 @@ class MissingOrBadTests(unittest.TestCase):
     def test_real_model_names_are_not_taken_for_credentials(self):
         for model_id in ["Meta-Llama-3.1-70B-Instruct", "claude-3-5-sonnet-20241022", "gpt-4.1-mini"]:
             with self.subTest(model_id=model_id):
-                require_pin(fields(model_id=model_id))
+                require_pin(file_fields(model_id=model_id))
 
     def test_a_moving_model_version_is_refused(self):
         for value in ["latest", "LATEST", "main", "Master", "HEAD", "2026-09-01", "v1.0"]:
             with self.subTest(value=value):
                 with self.assertRaises(PinInvalid) as ctx:
-                    require_pin(fields(model_version=value))
+                    require_pin(file_fields(model_version=value))
                 self.assertIn("model_version", str(ctx.exception))
 
     def test_the_weights_digest_is_required(self):
@@ -258,6 +277,41 @@ class MissingOrBadTests(unittest.TestCase):
             with self.subTest(field=name, value=value):
                 with self.assertRaises(PinInvalid):
                     require_pin(fields(**{name: value}))
+
+    def test_zero_temperature_in_any_form_gives_one_digest(self):
+        digests = {require_pin(fields(temperature=value, top_p=1)).digest() for value in (0, 0.0, -0.0)}
+        self.assertEqual(len(digests), 1)
+        self.assertEqual(require_pin(fields(top_p=1)).digest(), require_pin(fields(top_p=1.0)).digest())
+
+    def test_a_provider_snapshot_needs_a_dated_snapshot_id(self):
+        for model_id in ["example-model", "example-model-latest", "example-model-2026", "example-model-20261340"]:
+            with self.subTest(model_id=model_id):
+                digest = provider_snapshot_digest(PROVIDER, model_id)
+                with self.assertRaises(PinInvalid) as ctx:
+                    require_pin(fields(model_id=model_id, model_version=digest, weights_sha256=digest))
+                self.assertIn("dated snapshot", str(ctx.exception))
+
+    def test_a_provider_snapshot_digest_must_match_the_rule(self):
+        for name in ["model_version", "weights_sha256"]:
+            with self.subTest(field=name):
+                with self.assertRaises(PinInvalid) as ctx:
+                    require_pin(fields(**{name: "e" * 64}))
+                self.assertIn(name, str(ctx.exception))
+        other = provider_snapshot_digest("another-provider", SNAPSHOT)
+        with self.assertRaises(PinInvalid):
+            require_pin(fields(model_version=other, weights_sha256=other))
+
+    def test_different_weights_kinds_never_compare_equal(self):
+        file_pin = require_pin(file_fields())
+        manifest_pin = require_pin(file_fields(weights_kind="manifest"))
+        self.assertNotEqual(file_pin.digest(), manifest_pin.digest())
+        self.assertNotEqual(file_pin, manifest_pin)
+
+    def test_an_unknown_weights_kind_is_refused(self):
+        for value in ["File", "snapshot", "", None]:
+            with self.subTest(value=value):
+                with self.assertRaises(PinInvalid):
+                    require_pin(fields(weights_kind=value))
 
     def test_a_non_mapping_is_refused(self):
         for value in [None, [], ["model_id"], "model_id"]:
@@ -292,33 +346,50 @@ class MissingOrBadTests(unittest.TestCase):
             prompt_sha256("")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class VerifyPinTests(unittest.TestCase):
     def setUp(self):
         self.pin = require_pin(fields())
 
+    def disk(self, **overrides):
+        values = dict(
+            harness_head=HARNESS,
+            corpus_head=CORPUS,
+            prompt_text=PROMPT_TEXT,
+            weights_digest=SNAPSHOT_DIGEST,
+            model_version=SNAPSHOT_DIGEST,
+            runtime_version="0.6.3",
+            client_version="1.51.0",
+        )
+        values.update(overrides)
+        return values
+
     def test_a_pin_that_matches_the_disk_passes(self):
-        verify_pin(self.pin, HARNESS, CORPUS, PROMPT_TEXT, WEIGHTS)
+        verify_pin(self.pin, **self.disk())
 
     def test_each_mismatch_is_named(self):
-        for name, args in [
-            ("harness_commit", ("e" * 40, CORPUS, PROMPT_TEXT, WEIGHTS)),
-            ("corpus_commit", (HARNESS, "e" * 40, PROMPT_TEXT, WEIGHTS)),
-            ("prompt_sha256", (HARNESS, CORPUS, PROMPT_TEXT + "!", WEIGHTS)),
-            ("weights_sha256", (HARNESS, CORPUS, PROMPT_TEXT, "e" * 64)),
+        for name, overrides in [
+            ("harness_commit", {"harness_head": "e" * 40}),
+            ("corpus_commit", {"corpus_head": "e" * 40}),
+            ("prompt_sha256", {"prompt_text": PROMPT_TEXT + "!"}),
+            ("weights_sha256", {"weights_digest": "e" * 64}),
+            ("model_version", {"model_version": "e" * 64}),
+            ("runtime_version", {"runtime_version": "0.6.4"}),
+            ("client_version", {"client_version": "1.52.0"}),
         ]:
             with self.subTest(field=name):
                 with self.assertRaises(PinMismatch) as ctx:
-                    verify_pin(self.pin, *args)
+                    verify_pin(self.pin, **self.disk(**overrides))
                 self.assertEqual(str(ctx.exception), f"the pin does not match what is on disk: ['{name}']")
 
     def test_an_empty_prompt_is_a_mismatch_not_a_crash(self):
         with self.assertRaises(PinMismatch):
-            verify_pin(self.pin, HARNESS, CORPUS, "", WEIGHTS)
+            verify_pin(self.pin, **self.disk(prompt_text=""))
 
     def test_no_pin_is_a_mismatch(self):
         with self.assertRaises(PinMismatch):
-            verify_pin(None, HARNESS, CORPUS, PROMPT_TEXT, WEIGHTS)
+            verify_pin(None, **self.disk())
+
+
+if __name__ == "__main__":
+    unittest.main()
