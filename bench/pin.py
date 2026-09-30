@@ -48,7 +48,9 @@ import hashlib
 import json
 import math
 import re
+from datetime import datetime
 from dataclasses import asdict, dataclass
+from typing import Optional
 
 SCHEMA = 1
 
@@ -75,7 +77,14 @@ _MOVING_VERSION_NAMES = frozenset({"latest", "main", "master", "head"})
 WEIGHTS_KINDS = ("file", "manifest", "provider_snapshot")
 # A dated snapshot id carries a calendar date, such as 20241022 or
 # 2024-08-06.
-_SNAPSHOT_DATE_RE = re.compile(r"(?<![0-9])(?:19|20)[0-9]{2}-?(?:0[1-9]|1[0-2])-?(?:0[1-9]|[12][0-9]|3[01])(?![0-9])")
+# A date inside a snapshot id: YYYYMMDD, or YYYY-MM-DD with the same
+# separator both times. datetime.strptime then proves it is a real date.
+_SNAPSHOT_DATE_RE = re.compile(r"(?<![0-9])((?:19|20)[0-9]{2})(-?)([0-9]{2})\2([0-9]{2})(?![0-9])")
+# Words that name a moving target, never a fixed snapshot.
+_MOVING_SNAPSHOT_WORDS = frozenset({
+    "latest", "preview", "beta", "alpha", "exp", "experimental", "nightly",
+    "canary", "dev", "current", "main", "master", "head",
+})
 
 # Up to three parts split by `/`, such as a host, an organization, and a
 # model with a `:tag` (an Ollama tag or a quantization suffix).
@@ -176,9 +185,28 @@ _CHECKS = {
 }
 
 
+def _has_real_date(snapshot_id: str) -> bool:
+    for match in _SNAPSHOT_DATE_RE.finditer(snapshot_id):
+        year, separator, month, day = match.groups()
+        try:
+            datetime.strptime(f"{year}-{month}-{day}", "%Y-%m-%d")
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _names_a_moving_target(snapshot_id: str) -> bool:
+    return any(word in _MOVING_SNAPSHOT_WORDS for word in re.split(r"[-_.:/]", snapshot_id.lower()))
+
+
 def provider_snapshot_digest(provider: str, snapshot_id: str) -> str:
     """model_version and weights_sha256 for a provider_snapshot pin: the
-    SHA-256 of "<provider>|<snapshot id>"."""
+    SHA-256 of "<provider>|<snapshot id>".
+
+    It is a consistency check that ties the pin to one provider and one
+    dated snapshot id. It is not a hash of the model's content, which a
+    hosted provider does not expose."""
     return hashlib.sha256(f"{provider}|{snapshot_id}".encode("utf-8")).hexdigest()
 
 
@@ -220,8 +248,10 @@ class RunPin:
         if bad:
             raise PinInvalid(f"pin fields with a value of the wrong shape: {bad}")
         if self.weights_kind == "provider_snapshot":
-            if not _SNAPSHOT_DATE_RE.search(self.model_id):
+            if not _has_real_date(self.model_id):
                 raise PinInvalid("a provider_snapshot pin needs a dated snapshot id in model_id")
+            if _names_a_moving_target(self.model_id):
+                raise PinInvalid("a provider_snapshot model_id names a moving target, not a snapshot")
             expected = provider_snapshot_digest(self.runtime_name, self.model_id)
             wrong = [name for name in ("model_version", "weights_sha256") if getattr(self, name) != expected]
             if wrong:
@@ -273,6 +303,7 @@ def verify_pin(
     model_version: str,
     runtime_version: str,
     client_version: str,
+    served_model_id: Optional[str] = None,
 ) -> None:
     """Check a pin against what is actually on disk, or raise PinMismatch
     naming each field that differs.
@@ -283,9 +314,21 @@ def verify_pin(
     the runtime and client versions in use, then calls this
     before it calls the spend guard, so a run never spends on inputs
     that differ from its pin.
+
+    The harness picks the kind to verify from the endpoint type, never
+    from the pin. For a provider_snapshot pin, weights_digest and
+    model_version are not trusted: served_model_id is the model id the
+    provider's response reports, it must equal the pin's model_id, and
+    this function computes the snapshot digest itself from it.
     """
     if not isinstance(pin, RunPin):
         raise PinMismatch("there is no pin to verify")
+    if pin.weights_kind == "provider_snapshot":
+        if not isinstance(served_model_id, str) or pin.model_id != served_model_id:
+            raise PinMismatch("the pin does not match what is on disk: ['model_id']")
+        served_digest = provider_snapshot_digest(pin.runtime_name, served_model_id)
+        weights_digest = served_digest
+        model_version = served_digest
     try:
         prompt_digest = prompt_sha256(prompt_text)
     except PinInvalid:

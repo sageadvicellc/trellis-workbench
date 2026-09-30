@@ -291,6 +291,27 @@ class MissingOrBadTests(unittest.TestCase):
                     require_pin(fields(model_id=model_id, model_version=digest, weights_sha256=digest))
                 self.assertIn("dated snapshot", str(ctx.exception))
 
+    def test_a_snapshot_date_must_be_a_real_calendar_date(self):
+        for model_id in ["example-model-20240231", "example-model-2024-0806", "example-model-202408-06",
+                         "example-model-19991332"]:
+            with self.subTest(model_id=model_id):
+                digest = provider_snapshot_digest(PROVIDER, model_id)
+                with self.assertRaises(PinInvalid):
+                    require_pin(fields(model_id=model_id, model_version=digest, weights_sha256=digest))
+        for model_id in ["example-model-2024-08-06", "example-model-20240229"]:
+            with self.subTest(model_id=model_id):
+                digest = provider_snapshot_digest(PROVIDER, model_id)
+                require_pin(fields(model_id=model_id, model_version=digest, weights_sha256=digest))
+
+    def test_a_snapshot_id_that_names_a_moving_target_is_refused(self):
+        for model_id in ["example-model-latest-20260930", "example-model-preview-20260930",
+                         "example-model-20260930-beta", "Example-Model-LATEST-20260930"]:
+            with self.subTest(model_id=model_id):
+                digest = provider_snapshot_digest(PROVIDER, model_id)
+                with self.assertRaises(PinInvalid) as ctx:
+                    require_pin(fields(model_id=model_id, model_version=digest, weights_sha256=digest))
+                self.assertIn("moving target", str(ctx.exception))
+
     def test_a_provider_snapshot_digest_must_match_the_rule(self):
         for name in ["model_version", "weights_sha256"]:
             with self.subTest(field=name):
@@ -360,7 +381,13 @@ class VerifyPinTests(unittest.TestCase):
             model_version=SNAPSHOT_DIGEST,
             runtime_version="0.6.3",
             client_version="1.51.0",
+            served_model_id=SNAPSHOT,
         )
+        values.update(overrides)
+        return values
+
+    def file_disk(self, **overrides):
+        values = self.disk(weights_digest=WEIGHTS, model_version=REVISION, served_model_id=None)
         values.update(overrides)
         return values
 
@@ -368,19 +395,41 @@ class VerifyPinTests(unittest.TestCase):
         verify_pin(self.pin, **self.disk())
 
     def test_each_mismatch_is_named(self):
+        file_pin = require_pin(file_fields())
+        verify_pin(file_pin, **self.file_disk())
         for name, overrides in [
             ("harness_commit", {"harness_head": "e" * 40}),
             ("corpus_commit", {"corpus_head": "e" * 40}),
             ("prompt_sha256", {"prompt_text": PROMPT_TEXT + "!"}),
             ("weights_sha256", {"weights_digest": "e" * 64}),
-            ("model_version", {"model_version": "e" * 64}),
+            ("model_version", {"model_version": "e" * 40}),
             ("runtime_version", {"runtime_version": "0.6.4"}),
             ("client_version", {"client_version": "1.52.0"}),
         ]:
             with self.subTest(field=name):
                 with self.assertRaises(PinMismatch) as ctx:
-                    verify_pin(self.pin, **self.disk(**overrides))
+                    verify_pin(file_pin, **self.file_disk(**overrides))
                 self.assertEqual(str(ctx.exception), f"the pin does not match what is on disk: ['{name}']")
+
+    def test_a_provider_snapshot_is_checked_against_the_served_model(self):
+        for served in ["example-model-20261001", "another-model-20260930", None]:
+            with self.subTest(served=served):
+                with self.assertRaises(PinMismatch) as ctx:
+                    verify_pin(self.pin, **self.disk(served_model_id=served))
+                self.assertEqual(str(ctx.exception), "the pin does not match what is on disk: ['model_id']")
+
+    def test_echoing_the_pin_back_does_not_pass_a_provider_snapshot(self):
+        with self.assertRaises(PinMismatch):
+            verify_pin(self.pin, **self.disk(
+                weights_digest=self.pin.weights_sha256,
+                model_version=self.pin.model_version,
+                served_model_id="example-model-20261001",
+            ))
+
+    def test_a_provider_snapshot_computes_its_own_digest(self):
+        # The caller's weights_digest and model_version are not trusted for
+        # a provider snapshot; the served model id decides.
+        verify_pin(self.pin, **self.disk(weights_digest="e" * 64, model_version="e" * 64))
 
     def test_an_empty_prompt_is_a_mismatch_not_a_crash(self):
         with self.assertRaises(PinMismatch):
