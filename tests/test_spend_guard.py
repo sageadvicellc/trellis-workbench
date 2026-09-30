@@ -479,6 +479,32 @@ class TimeAndGpuTests(unittest.TestCase):
         self.assertIn("start timed out", result.reason)
         self.assertEqual(gpu.torn_down, 1)
         self.assertEqual(args["endpoint"].calls, [])
+        # The start never finished, so the GPU could still come up after
+        # the teardown: the teardown is not confirmed.
+        self.assertFalse(result.teardown_confirmed)
+        self.assertIn("the GPU start was still in flight at teardown", result.notes)
+
+    def test_a_start_that_finishes_after_its_timeout_is_torn_down_after_it(self):
+        events = []
+
+        class SlowStartGpu(StubGpu):
+            def start(self):
+                self.started += 1
+                threading.Event().wait(0.15)
+                events.append("started")
+
+            def teardown(self):
+                self.torn_down += 1
+                events.append("torn down")
+                return True
+
+        gpu = SlowStartGpu()
+        args, result = guarded(gpu=gpu, gpu_call_timeout_s=0.05)
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertIn("start timed out", result.reason)
+        self.assertEqual(events, ["started", "torn down"])
+        self.assertTrue(result.teardown_confirmed)
+        self.assertEqual(args["endpoint"].calls, [])
 
     def test_a_hanging_teardown_counts_as_unconfirmed(self):
         class HangingTeardownGpu(StubGpu):
@@ -641,7 +667,64 @@ class InterruptTests(unittest.TestCase):
             guarded(gpu=gpu)
         result = ctx.exception.run_result
         self.assertTrue(result.teardown_confirmed)
-        self.assertIn("a SIGINT during cleanup was held until the teardown finished", result.notes)
+        self.assertIn("KeyboardInterrupt during cleanup was held until the teardown finished", result.notes)
+
+    def test_a_sigterm_during_teardown_is_held_then_raised_after_the_record(self):
+        before = signal.getsignal(signal.SIGTERM)
+
+        class SignalledGpu(StubGpu):
+            def teardown(self):
+                self.torn_down += 1
+                os.kill(os.getpid(), signal.SIGTERM)
+                threading.Event().wait(0.05)
+                return True
+
+        out = io.StringIO()
+        with self.assertRaises(Terminated) as ctx:
+            guarded(gpu=SignalledGpu(), out=out)
+        result = ctx.exception.run_result
+        self.assertEqual(result.status, RunStatus.COMPLETED)
+        self.assertTrue(result.teardown_confirmed)
+        self.assertIn("Terminated during cleanup was held until the teardown finished", result.notes)
+        self.assertIn("Record: ", out.getvalue())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_a_signal_sent_from_another_thread_during_cleanup_is_held(self):
+        class ThreadSignalGpu(StubGpu):
+            def teardown(self):
+                self.torn_down += 1
+                sender = threading.Thread(target=lambda: signal.pthread_kill(threading.main_thread().ident, signal.SIGHUP))
+                sender.start()
+                sender.join()
+                threading.Event().wait(0.05)
+                return True
+
+        if not hasattr(signal, "pthread_kill") or not hasattr(signal, "SIGHUP"):
+            self.skipTest("no pthread_kill or SIGHUP here")
+        with self.assertRaises(Terminated) as ctx:
+            guarded(gpu=ThreadSignalGpu())
+        self.assertTrue(ctx.exception.run_result.teardown_confirmed)
+
+    def test_the_saved_handlers_are_the_originals_even_if_install_is_cut_off(self):
+        saved = {}
+        spend_guard._save_signal_handlers(saved)
+        original_signal = signal.signal
+        calls = []
+
+        def cut_off(signum, handler):
+            calls.append(signum)
+            if len(calls) == 2:
+                raise Terminated("cut off")
+            return original_signal(signum, handler)
+
+        try:
+            with mock.patch.object(spend_guard.signal, "signal", side_effect=cut_off):
+                with self.assertRaises(Terminated):
+                    spend_guard._install_signal_handlers()
+            self.assertNotIn(spend_guard._raise_terminated, saved.values())
+        finally:
+            spend_guard._restore_signal_handlers(saved)
+        self.assertNotEqual(signal.getsignal(signal.SIGTERM), spend_guard._raise_terminated)
 
     def test_the_handlers_are_restored_after_a_normal_run(self):
         before = signal.getsignal(signal.SIGTERM)
