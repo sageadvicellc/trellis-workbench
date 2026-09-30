@@ -88,6 +88,9 @@ _COMMIT_OBJECT = "commit.object"
 _MAX_COMMIT_OBJECT_BYTES = 64 * 1024
 _COMMIT_ID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
 _OPTIONAL_COMMIT_HEADERS = ("encoding", "gpgsig", "mergetag")
+# git's identity line: a name, an email in angle brackets, a Unix time,
+# and a zone offset. No other text fits.
+_IDENTITY_RE = re.compile(r"(author|committer) ([^<>\n\r\x00]{1,256}) <([^<>\n\r\x00]{0,256})> [0-9]{1,19} [+-][0-9]{4}")
 
 _B = r"(?<![A-Za-z0-9])"  # a key starts at a word boundary
 _SECRET_PATTERNS = {
@@ -296,9 +299,11 @@ class _Matcher:
         rules = []
         if any(term in folded or squash in squashed for term, squash in self.terms):
             rules.append("sanitizer:deny_term")
-        if any(pattern.search(folded) for pattern in self.clients):
-            rules.append("sanitizer:client_repository")
-        return rules
+        return rules + self.client_rules(text)
+
+    def client_rules(self, text: str) -> list:
+        folded = _fold(text)
+        return ["sanitizer:client_repository"] if any(p.search(folded) for p in self.clients) else []
 
 
 def _secret_rules(text: str) -> list:
@@ -335,9 +340,12 @@ def _commit_object_findings(relative: str, data: bytes, matcher: _Matcher) -> li
     index = 1
     while index < len(lines) and re.fullmatch(r"parent " + _COMMIT_ID, lines[index]):
         index += 1
+    identities = {}
     for field in ("author", "committer"):
-        if index >= len(lines) or not re.fullmatch(field + r" [^\n]+", lines[index]):
+        match = _IDENTITY_RE.fullmatch(lines[index]) if index < len(lines) else None
+        if match is None or match.group(1) != field:
             return bad()
+        identities[index] = (match.group(2), match.group(3))
         index += 1
     in_header = None
     for line in lines[index:]:
@@ -350,8 +358,15 @@ def _commit_object_findings(relative: str, data: bytes, matcher: _Matcher) -> li
 
     findings = []
     for number, line in enumerate(lines, start=1):
-        if line.startswith(("author ", "committer ")):
-            rules = [rule for rule in _secret_rules(line) if rule.startswith("secret:")]
+        if number - 1 in identities:
+            # The name and email get the secret patterns and the client
+            # check. Not the deny terms, which name the practice's own
+            # people, and not the email rule, which the email always trips.
+            rules = []
+            for part in identities[number - 1]:
+                rules += [rule for rule in _secret_rules(part) if rule.startswith("secret:")]
+                rules += matcher.client_rules(part)
+            rules = list(dict.fromkeys(rules))
         else:
             rules = _secret_rules(line) + matcher.rules(line)
         findings.extend(Finding(relative, number, rule) for rule in rules)

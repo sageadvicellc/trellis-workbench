@@ -477,9 +477,46 @@ class CommitObjectTests(CorpusTestCase):
         self.assertIn("sanitizer:client_repository", self.object_findings(self.valid(extra_headers=mergetag)))
         self.assertIn("sanitizer:deny_term", self.object_findings(self.valid(message="zz private term\n")))
 
-    def test_author_and_committer_lines_get_the_secret_patterns_only(self):
-        person = self.valid().replace("Example Author", "Client Site")
+    def test_a_client_name_on_an_identity_line_is_a_finding(self):
+        for field in ("author", "committer"):
+            with self.subTest(field=field):
+                text = self.valid().replace(f"{field} Example Author", f"{field} Client Site")
+                self.assertIn("sanitizer:client_repository", self.object_findings(text))
+        email = self.valid().replace("<author@example.invalid>", "<client-site@example.invalid>", 1)
+        self.assertIn("sanitizer:client_repository", self.object_findings(email))
+
+    def test_a_real_name_and_email_pass_on_an_identity_line(self):
+        self.assertEqual(self.object_findings(self.valid()), set())
+
+    def test_a_deny_term_in_the_name_passes(self):
+        # The practice's own people are deny terms, so a name is not
+        # checked against them.
+        person = self.valid().replace("Example Author", "Zz Private Term")
         self.assertEqual(self.object_findings(person), set())
+
+    def test_an_identity_line_must_have_git_s_shape(self):
+        person = self.PERSON
+        for line in [
+            "author just some free text",
+            "author Example Author author@example.invalid 1790000000 +0000",
+            "author Example Author <author@example.invalid> yesterday +0000",
+            "author Example Author <author@example.invalid> 1790000000 UTC",
+            "author Example\rAuthor <author@example.invalid> 1790000000 +0000",
+            "author Example\x00Author <author@example.invalid> 1790000000 +0000",
+            "author Example <Author> <author@example.invalid> 1790000000 +0000",
+            "author " + "x" * 257 + " <author@example.invalid> 1790000000 +0000",
+            "author Example Author <" + "e" * 257 + "> 1790000000 +0000",
+            "author Example Author <author@example.invalid> 1790000000 +0000 trailing",
+        ]:
+            with self.subTest(line=line[:50]):
+                text = f"tree {self.TREE}\n{line}\ncommitter {person}\n\nExample commit\n"
+                self.assertEqual(self.object_findings(text), {"sanitizer:commit_object_format"})
+        swapped = f"tree {self.TREE}\ncommitter {person}\ncommitter {person}\n\nExample commit\n"
+        self.assertEqual(self.object_findings(swapped), {"sanitizer:commit_object_format"})
+
+    def test_a_key_in_an_identity_email_is_found(self):
+        text = self.valid().replace("<author@example.invalid>", "<" + AWS_KEY + "@example.invalid>", 1)
+        self.assertIn("secret:aws_access_key", self.object_findings(text))
 
     def test_a_real_git_commit_object_passes_the_scan(self):
         if shutil.which("git") is None:
