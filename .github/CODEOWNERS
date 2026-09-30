@@ -5,3 +5,8 @@
 /corpus/allowlist.txt @hannasage
 /corpus/tasks/ @hannasage
 /.github/CODEOWNERS @hannasage
+
+# The founder also owns the workflows and the spend guard, because they
+# decide what runs and what it may spend.
+/.github/ @hannasage
+/bench/spend_guard.py @hannasage
