@@ -58,10 +58,11 @@ sys.exit(0 if path.exists() and path.read_text().strip() == "42" else 3)
 """
 
 HARNESS_HEAD = """#!{python}
-import http.client, json, os, pathlib, sys, time, urllib.error, urllib.parse, urllib.request
+import http.client, json, os, pathlib, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 ENDPOINT = {endpoint!r}
 REPORT = pathlib.Path({report!r})
 DECOY = {decoy!r}
+SOURCE = {source!r}
 
 def report(**fields):
     REPORT.write_text(json.dumps(fields))
@@ -144,11 +145,48 @@ pathlib.Path("answer.txt").write_text(answer["choices"][0]["message"]["content"]
 report(started=True)
 """
 
+NO_CALL_BODY = """
+pathlib.Path("answer.txt").write_text("42\\n")
+report(started=True)
+"""
+
+ATTRIBUTES_BODY = """
+ask()
+pathlib.Path(".gitattributes").write_text("* filter=mark\\n")
+pathlib.Path("answer.txt").write_text("42\\n")
+report(started=True)
+"""
+
+WORKTREE_LIST_BODY = """
+ask()
+listing = subprocess.run(["git", "-C", SOURCE, "worktree", "list", "--porcelain"], capture_output=True,
+                         text=True).stdout
+pathlib.Path("answer.txt").write_text("42\\n")
+report(worktrees=[line for line in listing.splitlines() if line.startswith("worktree ")])
+"""
+
+GATE_WRAPPER = """#!{python}
+import json, os, sys
+with open({log!r}, "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+os.execvp(sys.argv[1], sys.argv[1:])
+"""
+
+MARK_FILTER = """#!{python}
+import pathlib, shutil, sys
+pathlib.Path({marker!r}).write_text("the filter ran\\n")
+shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)
+"""
+
 PLANT_NESTED_BODY = """
 pathlib.Path("vendor/.git").mkdir(parents=True)
 pathlib.Path("answer.txt").write_text("42\\n")
 report(started=True)
 """
+
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+OMIT = object()  # a run() override that leaves the argument out
 
 
 class FakeClock:
@@ -201,6 +239,18 @@ class Fixture:
                               model_version=SNAPSHOT_DIGEST, runtime_version="0.6.3", client_version="1.51.0",
                               endpoint_kind="provider_snapshot", served_model_id=SNAPSHOT)
         self.write_harness(PASS_BODY)
+        # The stub gate sandbox: a wrapper that logs the gate argv it got,
+        # outside the worktree, then runs it.
+        self.gate_log = self.root / "gate-sandbox.log"
+        self.gate_wrapper = self.root / "gate-sandbox.py"
+        self.gate_wrapper.write_text(GATE_WRAPPER.format(python=sys.executable, log=str(self.gate_log)))
+        self.gate_wrapper.chmod(0o755)
+        self.last_read = None
+
+    def gate_runs(self):
+        if not self.gate_log.exists():
+            return []
+        return [json.loads(line) for line in self.gate_log.read_text().splitlines()]
 
     def git(self, *args):
         return subprocess.run(["git", "-C", str(self.source), *args], check=True, env=self.git_env,
@@ -237,7 +287,7 @@ class Fixture:
 
     def write_harness(self, body):
         head = HARNESS_HEAD.format(python=sys.executable, endpoint=self.endpoint.url, report=str(self.report),
-                                   decoy=self.decoy.port)
+                                   decoy=self.decoy.port, source=str(self.source))
         self.harness_path.write_text(head + body)
         self.harness_path.chmod(0o755)
 
@@ -255,9 +305,11 @@ class Fixture:
                     pin_facts=self.pin_facts, spend=self.spend(), out=io.StringIO(), work_root=self.work_root,
                     record_dir=self.record_dir, run_id="run-1", harness_binary=str(self.harness_path),
                     base_env=self.base_env, harness_timeout_s=30, gate_timeout_s=30,
-                    clock=FakeClock(100.0, 112.5))
+                    clock=FakeClock(100.0, 112.5), gate_sandbox=[str(self.gate_wrapper)])
         args.update(overrides)
+        args = {name: value for name, value in args.items() if value is not OMIT}
         read = mock.Mock(return_value=answer)
+        self.last_read = read
         with mock.patch.object(spend_guard, "_stdin_is_tty", return_value=tty), \
                 mock.patch.object(spend_guard, "_out_is_tty", return_value=tty), \
                 mock.patch.object(spend_guard, "_read_answer", read):
@@ -284,6 +336,11 @@ class ReplayTestCase(unittest.TestCase):
             self.skipTest("the stub harness needs a Python path with no white space for its #! line")
         self.fx = Fixture()
         self.addCleanup(self.fx.close)
+
+    def _task(self, **changes):
+        fields = {name: getattr(self.fx.task, name) for name in self.fx.task.__dataclass_fields__}
+        fields.update(changes)
+        return Task(**fields)
 
     def assertCleanedUp(self):
         self.assertEqual(len(self.fx.worktrees()), 1, "only the source repository's own worktree remains")
@@ -314,6 +371,8 @@ class PassTests(ReplayTestCase):
         self.assertEqual(record["egress"]["allowed_requests"], 2)
         self.assertEqual(record["egress"]["refused"], [])
         self.assertTrue(record["worktree_removed"])
+        self.assertEqual(record["gate"]["sandbox"], [str(self.fx.gate_wrapper)])
+        self.assertEqual(self.fx.gate_runs(), [["python3", "check.py"]], "the gate ran under the sandbox prefix")
         self.assertCleanedUp()
 
     def test_the_record_holds_the_pin_unchanged_and_its_digest_in_one_file(self):
@@ -382,6 +441,7 @@ class FailTests(ReplayTestCase):
         self.assertEqual(record["gate"]["commands"][0]["exit_code"], 3)
         self.assertEqual(record["tokens"]["input"], 11)
         self.assertEqual(record["diff"], {"files": 1, "added": 1, "deleted": 0, "binary_files": 0})
+        self.assertEqual(self.fx.gate_runs(), [["python3", "check.py"]], "the gate ran under the sandbox prefix")
         self.assertCleanedUp()
 
 
@@ -399,7 +459,10 @@ class BlockedNetworkTests(ReplayTestCase):
                                                    ("CONNECT", "127.0.0.1", self.fx.decoy.port)]))
         self.assertEqual(self.fx.decoy.connections, 0, "no connection reached the refused port")
         self.assertEqual(self.fx.endpoint.requests, [])
-        self.assertEqual(result.record["outcome"], "fail")
+        # The harness exited 0 with no model call through the proxy, so its
+        # tokens are unknown and the spend guard fails the run.
+        self.assertEqual(result.record["tokens"]["reason"], "no call went through the proxy")
+        self.assertEqual(result.record["outcome"], "error")
         self.assertCleanedUp()
 
 
@@ -464,6 +527,10 @@ class WorktreeTests(ReplayTestCase):
         self.assertTrue(self.fx.harness_report()["started"])
         self.assertEqual(result.record["harness"]["exit_code"], 1)
         self.assertEqual(result.record["outcome"], "fail")
+        # A harness that did not exit 0 made no claim of work, so no call
+        # stays a known 0.
+        self.assertEqual(result.record["tokens"], {"input": 0, "output": 0, "model_calls": 0, "known": True,
+                                                   "reason": None})
         self.assertCleanedUp()
 
     def test_the_worktree_is_removed_when_the_harness_cannot_start(self):
@@ -495,11 +562,6 @@ class WorktreeTests(ReplayTestCase):
         self.assertIn("tree", result.record["reason"])
         self.assertIsNone(self.fx.harness_report())
         self.assertCleanedUp()
-
-    def _task(self, **changes):
-        fields = {name: getattr(self.fx.task, name) for name in self.fx.task.__dataclass_fields__}
-        fields.update(changes)
-        return Task(**fields)
 
 
 class GuardRefusalTests(ReplayTestCase):
@@ -543,6 +605,100 @@ class GuardRefusalTests(ReplayTestCase):
         self.assertNothingRan()
 
 
+class GateSandboxTests(ReplayTestCase):
+    def test_a_missing_or_empty_gate_sandbox_is_refused_before_the_spend_guard_and_any_side_effect(self):
+        for sandbox in (OMIT, None, [], (), [""], ["-x"], [str(self.fx.gate_wrapper), "bad\x00"], "a-string"):
+            with self.subTest(sandbox=sandbox):
+                with mock.patch.object(spend_guard, "run_guarded") as guarded, \
+                        mock.patch.object(egress.EgressProxy, "start") as start, \
+                        mock.patch("subprocess.Popen") as popen, mock.patch("subprocess.run") as run:
+                    with self.assertRaises(ReplayRefused) as ctx:
+                        self.fx.run(gate_sandbox=sandbox)
+                    guarded.assert_not_called()
+                    start.assert_not_called()
+                    popen.assert_not_called()
+                    run.assert_not_called()
+                self.fx.last_read.assert_not_called()
+                self.assertIn("gate_sandbox", str(ctx.exception))
+                self.assertNothingRan()
+        self.assertEqual(self.fx.gate_runs(), [])
+
+    def test_every_gate_command_runs_under_the_prefix(self):
+        result, _ = self.fx.run(task=self._task(gates=(("python3", "check.py"), ("python3", "-c", "pass"))))
+        self.assertEqual(self.fx.gate_runs(), [["python3", "check.py"], ["python3", "-c", "pass"]])
+        self.assertEqual([c["argv"] for c in result.record["gate"]["commands"]],
+                         [["python3", "check.py"], ["python3", "-c", "pass"]])
+
+
+class GitAttributesTests(ReplayTestCase):
+    def test_every_git_call_reads_attributes_from_the_empty_tree(self):
+        real_run = subprocess.run
+        seen = []
+
+        def spy(argv, *args, **kwargs):
+            if argv and argv[0] == "git":
+                seen.append((list(argv), kwargs.get("env") or {}))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=spy):
+            self.fx.run()
+        self.assertGreater(len(seen), 5)
+        for argv, env in seen:
+            with self.subTest(argv=argv):
+                self.assertEqual(env.get("GIT_ATTR_SOURCE"), EMPTY_TREE)
+
+    def test_a_model_written_gitattributes_cannot_run_a_filter_from_the_operator_config(self):
+        marker = self.fx.root / "filter-ran"
+        mark = self.fx.root / "mark-filter.py"
+        mark.write_text(MARK_FILTER.format(python=sys.executable, marker=str(marker)))
+        mark.chmod(0o755)
+        (self.fx.home / ".gitconfig").write_text(f'[filter "mark"]\n\tclean = {mark}\n\tsmudge = {mark}\n')
+        self.fx.write_harness(ATTRIBUTES_BODY)
+        result, _ = self.fx.run()
+        self.assertTrue(self.fx.harness_report()["started"])
+        self.assertIsNotNone(result.record["diff"])
+        self.assertFalse(marker.exists(), "the model-named filter never ran")
+        self.assertCleanedUp()
+        # Control: plain git with the same config does run the filter, so
+        # the fixture would have caught a replay that let it run.
+        control = self.fx.root / "control"
+        control.mkdir()
+        (control / ".gitattributes").write_text("* filter=mark\n")
+        (control / "a.txt").write_text("a\n")
+        subprocess.run(["git", "-C", str(control), "init", "-q"], check=True, env=self.fx.git_env,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(control), "add", "-A"], check=True, env=self.fx.git_env,
+                       capture_output=True)
+        self.assertTrue(marker.exists())
+
+
+class NoCallTokenTests(ReplayTestCase):
+    def test_a_harness_that_exits_0_with_no_call_through_the_proxy_has_unknown_tokens(self):
+        self.fx.write_harness(NO_CALL_BODY)
+        result, _ = self.fx.run()
+        self.assertEqual(result.record["harness"]["exit_code"], 0)
+        self.assertEqual(result.record["tokens"], {"input": None, "output": None, "model_calls": 0,
+                                                   "known": False, "reason": "no call went through the proxy"})
+        self.assertEqual(result.record["gate"]["result"], "pass")
+        self.assertEqual(result.spend.status, RunStatus.FAILED)
+        self.assertEqual(result.record["outcome"], "error")
+        self.assertCleanedUp()
+
+
+class PruneTests(ReplayTestCase):
+    def test_a_stale_worktree_entry_is_pruned_before_the_run(self):
+        stale = self.fx.root / "stale-tree"
+        self.fx.git("worktree", "add", "--detach", str(stale), self.fx.frozen)
+        shutil.rmtree(stale)
+        self.assertEqual(len(self.fx.worktrees()), 2, "the stale entry is listed before the run")
+        self.fx.write_harness(WORKTREE_LIST_BODY)
+        self.fx.run()
+        seen = self.fx.harness_report()["worktrees"]
+        self.assertFalse([line for line in seen if "stale-tree" in line], "pruned before the harness ran")
+        self.assertEqual(len(seen), 2, "the source and the run's own worktree")
+        self.assertCleanedUp()
+
+
 class ArgumentTests(ReplayTestCase):
     def test_an_existing_record_is_never_overwritten(self):
         (self.fx.record_dir / "run-run-1.json").write_text("{}")
@@ -570,8 +726,17 @@ class ReadmeTests(unittest.TestCase):
     def test_the_readme_describes_the_replay_harness_and_the_proxy_limit(self):
         readme = " ".join((REPO_ROOT / "README.md").read_text().split())
         self.assertIn("## Replay harness", (REPO_ROOT / "README.md").read_text())
-        for part in ["spend guard", "worktree", "egress proxy", "honor", "not blocked", "OS-level"]:
+        for part in ["spend guard", "worktree", "egress proxy", "honor", "not blocked", "OS-level",
+                     "gate_sandbox", "relay"]:
             self.assertIn(part, readme)
+
+    def test_the_docstrings_state_the_gate_sandbox_and_relay_rules(self):
+        from bench import replay
+        for module in (replay, egress):
+            text = " ".join(module.__doc__.split())
+            with self.subTest(module=module.__name__):
+                self.assertIn("gate_sandbox", text)
+                self.assertIn("relay", text)
 
 
 if __name__ == "__main__":

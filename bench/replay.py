@@ -5,10 +5,15 @@ and records the result. The order is fixed:
 
 1. The loopback gate. The endpoint must be a loopback address, checked
    on the parsed URL by egress.loopback_endpoint, before anything else.
-   Until an OS-level network layer lands, live endpoints are refused.
+   Until an OS-level network layer lands, live endpoints are refused. A
+   loopback endpoint is not proof of a local model: if a local relay
+   forwards a loopback endpoint to a vendor API, that endpoint is live,
+   and the operator must not point a run at such a relay.
 2. Pure checks, which start no worktree, process, or proxy: the
-   arguments, the codex argv guard (every extra launch flag refused),
-   and the pin. verify_pin runs here, before the spend guard, as pin.py
+   arguments, the gate_sandbox, the codex argv guard (every extra launch
+   flag refused), and the pin. Until #9's OS layer lands, the gate runs
+   no model-written code outside a sandbox, so a run with no
+   gate_sandbox, or an empty one, is refused here. verify_pin runs here, before the spend guard, as pin.py
    says, so no spend is approved for inputs that differ from the pin.
    The facts it compares against are handed in as pin_facts.
 3. The spend guard. run_guarded prints the estimate and waits for the
@@ -18,12 +23,16 @@ and records the result. The order is fixed:
    happens: no worktree, no process, no proxy, and no record file.
    The guard's request timeout and run limit bind the whole replay; when
    either passes, the harness is killed and the worktree removed.
-4. A fresh worktree: `git worktree add --detach --no-checkout` from the
-   task's source repository into the run's own temporary root, then the
-   guards, then the checkout. HEAD must equal the frozen commit and its
-   tree the task's tree, both in full. Every git call drops every GIT_
-   variable, and a git call that acts runs with no hooks and no
-   fsmonitor.
+4. A fresh worktree: `git worktree prune` on the source repository
+   first, to clear a stale entry, then `git worktree add --detach
+   --no-checkout` into the run's own temporary root, then the guards,
+   then the checkout. HEAD must equal the frozen commit and its tree the
+   task's tree, both in full. Every git call drops every GIT_ variable
+   and sets GIT_ATTR_SOURCE to the empty tree, so git reads no
+   .gitattributes. A git call that acts also runs with no hooks, no
+   fsmonitor, and every configured filter's commands emptied: a git
+   older than GIT_ATTR_SOURCE ignores the variable (Apple git 2.39.5
+   does), and the emptied filters are the layer that holds there.
 5. The guards (bench/guards.py, ported from trellis-crew #24) run on the
    empty worktree, again after the checkout, and again after the
    harness, before the gate: a worktree top, not home or /, no nested
@@ -39,14 +48,18 @@ and records the result. The order is fixed:
    harness_binary in the worktree, under a timeout. Tests pass a stub
    script as harness_binary; real codex is never run by the tests.
 8. The gate: the task's gate commands, run in the worktree with the proxy
-   refusing every host. Every command runs; the gate passes only if each
-   exits 0.
+   refusing every host. Each runs as gate_sandbox + its argv, because it
+   runs model-written code. Every command runs; the gate passes only if
+   each exits 0.
 9. The record. The diff size is `git diff --numstat` against the frozen
    commit, taken before the gate, with new files counted through
    `git add --intent-to-add`. Tokens are the endpoint's usage fields as
-   the proxy saw them; through a CONNECT tunnel they are unknown, and the
-   spend guard then fails the run rather than guess. Wall time is the
-   harness's start to exit, on the injected clock.
+   the proxy saw them. They are unknown through a CONNECT tunnel, and
+   when the harness exits 0 with no call through the proxy ("no call
+   went through the proxy"), since it may have reached a model some
+   other way. Unknown tokens make the spend guard fail the run rather
+   than guess. Wall time is the harness's start to exit, on the injected
+   clock.
 
 The record sits in the same file as the reproducibility pin: one JSON
 document at record_dir/run-<run_id>.json holds pin.record() unchanged
@@ -64,6 +77,7 @@ So every stop uses SIGKILL on the child's process group.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -196,10 +210,12 @@ def _kill_group(proc: subprocess.Popen) -> None:
             pass
 
 
-def _git(cwd, args: Sequence[str], git_env: Mapping[str, str], refuse: Optional[str] = None) -> str:
-    """Run one git call that acts, with no hooks and no fsmonitor."""
+def _git(cwd, args: Sequence[str], git_env: Mapping[str, str], refuse: Optional[str] = None,
+         overrides: Sequence[str] = ()) -> str:
+    """Run one git call that acts, with no hooks and no fsmonitor, plus
+    any filter overrides."""
     try:
-        done = subprocess.run(["git", "-C", str(cwd), *_GIT_ACT, *args], env=dict(git_env),
+        done = subprocess.run(["git", "-C", str(cwd), *_GIT_ACT, *overrides, *args], env=dict(git_env),
                               stdin=subprocess.DEVNULL, capture_output=True, timeout=GIT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise ReplayRefused(f"git {args[0]} did not answer in time") from None
@@ -228,6 +244,36 @@ def _run_child(state: _Run, argv: Sequence[str], cwd: Path, env: Mapping[str, st
             state.set_proc(None)
 
 
+def _filter_overrides(cwd, git_env: Mapping[str, str]) -> list:
+    """`-c` options that empty the clean, smudge, and process commands of
+    every filter git's config defines, and mark each one not required. A
+    git older than GIT_ATTR_SOURCE ignores that variable, so this is the
+    layer that holds there: a .gitattributes can name a filter, but the
+    filter has no command left to run. A filter name that cannot be
+    written as a `-c` key refuses the run."""
+    text = _git(cwd, ["config", "--list", "-z", "--includes"], git_env)
+    names = set()
+    for item in text.split("\0"):
+        section, subsection, _ = guards._split_key(item.split("\n", 1)[0])
+        if section == "filter" and subsection is not None:
+            names.add(subsection)
+    overrides = []
+    for name in sorted(names):
+        if "=" in name or _CONTROL.search(name):
+            raise ReplayRefused("a filter in git's config has a name that cannot be emptied, so it could still run")
+        for variable in ("clean", "smudge", "process"):
+            overrides += ["-c", f"filter.{name}.{variable}="]
+        overrides += ["-c", f"filter.{name}.required=false"]
+    return overrides
+
+
+def empty_tree(commit: str) -> str:
+    """The id of git's empty tree in the commit's hash format: SHA-1 for a
+    40-hex commit, SHA-256 for a 64-hex one."""
+    algorithm = "sha1" if len(commit) == 40 else "sha256"
+    return hashlib.new(algorithm, b"tree 0\0").hexdigest()
+
+
 def _read_gitfile(worktree: Path) -> Optional[bytes]:
     """The bytes of the worktree's .git gitfile, or None when .git is not
     a regular file. A link is never followed."""
@@ -241,12 +287,12 @@ def _read_gitfile(worktree: Path) -> Optional[bytes]:
         return None
 
 
-def _diff_size(worktree: Path, frozen: str, git_env: Mapping[str, str]) -> dict:
+def _diff_size(worktree: Path, frozen: str, git_env: Mapping[str, str], overrides: Sequence[str]) -> dict:
     """Files, lines added, and lines deleted against the frozen commit,
     new files included. A binary file counts as a file with no lines."""
-    _git(worktree, ["add", "--intent-to-add", "--all"], git_env)
+    _git(worktree, ["add", "--intent-to-add", "--all"], git_env, overrides=overrides)
     text = _git(worktree, ["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", frozen],
-                git_env)
+                git_env, overrides=overrides)
     files = added = deleted = binary = 0
     for item in text.split("\0"):
         if not item:
@@ -289,19 +335,33 @@ def _remove_run_root(source: Path, work_root: Path, run_root: Path, worktree: Pa
 
 def _replay(state: _Run, *, task, source: Path, endpoint: egress.Endpoint, argv: Sequence[str],
             env: Mapping[str, str], home: str, work_root: Path, run_id: str, request: Request,
-            harness_timeout_s: float, gate_timeout_s: float, clock: Callable[[], float]) -> Response:
-    git_env = guards.without_git_vars(env)
+            harness_timeout_s: float, gate_timeout_s: float, clock: Callable[[], float],
+            gate_sandbox: Sequence[str]) -> Response:
+    # Every git call reads attributes from the empty tree, so no
+    # .gitattributes, the frozen commit's or a model-written one, can
+    # name a filter or driver git would run.
+    attr_source = empty_tree(task.commit)
+    git_env = dict(guards.without_git_vars(env), GIT_ATTR_SOURCE=attr_source)
+
+    def check(folder) -> Optional[str]:
+        return guards.check_workdir(folder, home, env, runner=lambda args, cwd, run_env, timeout_s: guards.run_git(
+            args, cwd, dict(run_env, GIT_ATTR_SOURCE=attr_source), timeout_s))
+
     run_root = Path(tempfile.mkdtemp(prefix=f"replay-{run_id}-", dir=work_root))
     worktree = run_root / f"run-{run_id}"
     proxy = None
     try:
         state.check()
+        # A stale entry left by an earlier run that could not clean up is
+        # cleared first.
+        _git(source, ["worktree", "prune"], git_env)
         _git(source, ["worktree", "add", "--detach", "--no-checkout", str(worktree), task.commit], git_env,
              refuse="the frozen commit cannot be added as a worktree from the source repository")
-        problem = guards.check_workdir(worktree, home, env)
+        problem = check(worktree)
         if problem is not None:
             raise ReplayRefused(problem)
-        _git(worktree, ["checkout", "--force", "--detach", task.commit], git_env)
+        _git(worktree, ["checkout", "--force", "--detach", task.commit], git_env,
+             overrides=_filter_overrides(worktree, git_env))
         head = _git(worktree, ["rev-parse", "--verify", "HEAD"], git_env).strip()
         if head != task.commit:
             raise ReplayRefused("the worktree HEAD is not the frozen commit")
@@ -309,7 +369,7 @@ def _replay(state: _Run, *, task, source: Path, endpoint: egress.Endpoint, argv:
         tree = _git(worktree, ["rev-parse", "--verify", "HEAD^{tree}"], git_env).strip()
         if tree != task.tree:
             raise ReplayRefused("the frozen commit's tree is not the task's recorded tree")
-        problem = guards.check_workdir(worktree, home, env)
+        problem = check(worktree)
         if problem is not None:
             raise ReplayRefused(problem)
         gitfile = _read_gitfile(worktree)
@@ -330,22 +390,33 @@ def _replay(state: _Run, *, task, source: Path, endpoint: egress.Endpoint, argv:
         # git call, and the gate's grading, at another repository.
         if _read_gitfile(worktree) != gitfile:
             raise ReplayRefused("after the harness ran: the worktree's .git file changed")
-        problem = guards.check_workdir(worktree, home, env)
+        problem = check(worktree)
         if problem is not None:
             raise ReplayRefused(f"after the harness ran: {problem}")
-        state.diff = _diff_size(worktree, task.commit, git_env)
+        # Read again after the harness, so a filter added meanwhile is
+        # emptied too.
+        state.diff = _diff_size(worktree, task.commit, git_env, _filter_overrides(worktree, git_env))
         commands = []
         for index, gate in enumerate(task.gates):
             state.check()
-            code, timed_out = _run_child(state, list(gate), worktree, child, gate_timeout_s,
+            # The gate runs model-written code, so it runs only under the
+            # gate sandbox prefix.
+            code, timed_out = _run_child(state, [*gate_sandbox, *gate], worktree, child, gate_timeout_s,
                                          run_root / f"gate-{index}.log")
             commands.append({"argv": list(gate), "exit_code": code, "timed_out": timed_out})
         passed = bool(commands) and all(command["exit_code"] == 0 for command in commands)
-        state.gate = {"result": "pass" if passed else "fail", "commands": commands}
+        state.gate = {"result": "pass" if passed else "fail", "sandbox": list(gate_sandbox), "commands": commands}
     finally:
         if proxy is not None:
             proxy.stop()
-            state.tokens = proxy.usage()
+            usage = proxy.usage()
+            if usage.known and usage.calls == 0 and proxy.tunnels == 0 \
+                    and state.harness is not None and state.harness["exit_code"] == 0:
+                # A harness that finished its task with no model call seen
+                # may have reached a model some other way, so its tokens
+                # are unknown, never a known 0.
+                usage = egress.TokenUsage(None, None, 0, False, "no call went through the proxy")
+            state.tokens = usage
             state.egress = {
                 "endpoint": endpoint.authority,
                 "allowed_requests": proxy.allowed_requests,
@@ -378,6 +449,21 @@ def _outcome(result: RunResult, state: _Run):
     if state.gate["result"] == "pass":
         return "pass", "every gate command exited 0"
     return "fail", "a gate command did not exit 0"
+
+
+def _checked_gate_sandbox(gate_sandbox) -> list:
+    """The gate sandbox prefix as a list, or ReplayRefused. It must be a
+    non-empty list or tuple of non-empty strings with no control
+    character, and its first word must not be a flag."""
+    why = ("the gate runs model-written code, so until the OS layer (#9) lands a replay needs a gate_sandbox,"
+           " an argv prefix every gate command runs under")
+    if not isinstance(gate_sandbox, (list, tuple)) or not gate_sandbox:
+        raise ReplayRefused(f"{why}; none was given")
+    if not all(isinstance(word, str) and word and not _CONTROL.search(word) for word in gate_sandbox):
+        raise ReplayRefused(f"{why}; each gate_sandbox word must be a non-empty string with no control character")
+    if gate_sandbox[0].startswith("-"):
+        raise ReplayRefused(f"{why}; the first gate_sandbox word must be a program, never a flag")
+    return list(gate_sandbox)
 
 
 def _check_arguments(*, task, source_repo, spend, work_root, record_dir, run_id, harness_binary,
@@ -424,6 +510,7 @@ def run_replay(
     gate_timeout_s: float = 600.0,
     clock: Callable[[], float] = time.monotonic,
     cleanup_wait_s: float = 30.0,
+    gate_sandbox: Optional[Sequence[str]] = None,
 ) -> ReplayResult:
     """Run one replay in the order the module docstring gives, and write
     its record beside the pin.
@@ -443,6 +530,7 @@ def run_replay(
     _check_arguments(task=task, source_repo=source_repo, spend=spend, work_root=work_root, record_dir=record_dir,
                      run_id=run_id, harness_binary=harness_binary, harness_timeout_s=harness_timeout_s,
                      gate_timeout_s=gate_timeout_s, cleanup_wait_s=cleanup_wait_s)
+    sandbox = _checked_gate_sandbox(gate_sandbox)
     record_path = Path(record_dir) / f"run-{run_id}.json"
     if os.path.lexists(record_path):
         raise ReplayRefused("a record for this run id already exists, and a record is never overwritten")
@@ -480,7 +568,7 @@ def run_replay(
         try:
             return _replay(state, task=task, source=source, endpoint=endpoint, argv=argv, env=env, home=home,
                            work_root=work, run_id=run_id, request=req, harness_timeout_s=harness_timeout_s,
-                           gate_timeout_s=gate_timeout_s, clock=clock)
+                           gate_timeout_s=gate_timeout_s, clock=clock, gate_sandbox=sandbox)
         except ReplayRefused as refused:
             state.refused = str(refused)
             raise

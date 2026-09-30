@@ -1,7 +1,13 @@
 """The replay harness egress proxy and loopback gate (issue #6).
 
 Done-when 2 of trellis-workbench#6: network is open only to the model
-endpoint. This module gives two layers, and names the one it does not.
+endpoint. Until the OS layer of #9 lands, it is narrowed to two rules:
+the endpoint is loopback only, and the gate runs no model-written code
+outside a sandbox, so run_replay refuses a run with no gate_sandbox. A
+loopback endpoint is not proof of a local model: if a local relay
+forwards a loopback endpoint to a vendor API, that endpoint is live, and
+the operator must not point a run at such a relay. This module gives two
+layers, and names the one it does not.
 
 1. The loopback gate. Until an OS-level network layer lands, a replay
    takes only a loopback endpoint (the Tech Lead's ruling on #6).
