@@ -726,6 +726,99 @@ class InterruptTests(unittest.TestCase):
             spend_guard._restore_signal_handlers(saved)
         self.assertNotEqual(signal.getsignal(signal.SIGTERM), spend_guard._raise_terminated)
 
+    def _slow_start_gpu(self, signum, events, finish=True):
+        release = threading.Event()
+
+        class SlowStartGpu(StubGpu):
+            def start(self):
+                self.started += 1
+                os.kill(os.getpid(), signum)
+                if finish:
+                    threading.Event().wait(0.15)
+                    events.append("started")
+                else:
+                    release.wait(5)
+
+            def teardown(self):
+                self.torn_down += 1
+                events.append("torn down")
+                return True
+
+        return SlowStartGpu(), release
+
+    def test_a_sigint_during_a_slow_start_tears_down_after_the_start(self):
+        events = []
+        gpu, _release = self._slow_start_gpu(signal.SIGINT, events)
+        with self.assertRaises(KeyboardInterrupt) as ctx:
+            guarded(gpu=gpu)
+        self.assertEqual(events, ["started", "torn down"])
+        result = ctx.exception.run_result
+        self.assertEqual(result.status, RunStatus.FAILED)
+        self.assertTrue(result.teardown_confirmed)
+
+    def test_a_sigterm_during_a_slow_start_tears_down_after_the_start(self):
+        events = []
+        gpu, _release = self._slow_start_gpu(signal.SIGTERM, events)
+        with self.assertRaises(Terminated) as ctx:
+            guarded(gpu=gpu)
+        self.assertEqual(events, ["started", "torn down"])
+        self.assertTrue(ctx.exception.run_result.teardown_confirmed)
+
+    def test_an_interrupted_start_that_never_finishes_leaves_the_teardown_unconfirmed(self):
+        events = []
+        gpu, release = self._slow_start_gpu(signal.SIGINT, events, finish=False)
+        try:
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                guarded(gpu=gpu, gpu_call_timeout_s=0.05)
+        finally:
+            release.set()
+        result = ctx.exception.run_result
+        self.assertFalse(result.teardown_confirmed)
+        self.assertIn("the GPU start was still in flight at teardown", result.notes)
+
+    @unittest.skipUnless(hasattr(signal, "pthread_sigmask"), "no pthread_sigmask here")
+    def test_workers_start_with_the_signals_blocked(self):
+        masks = []
+
+        def endpoint(req):
+            masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+            return response(req)
+
+        guarded(endpoint=endpoint, requests=requests(1))
+        self.assertTrue({signal.SIGTERM, signal.SIGINT} <= set(masks[0]))
+        self.assertNotIn(signal.SIGTERM, signal.pthread_sigmask(signal.SIG_BLOCK, []))
+
+    def test_a_process_kill_with_an_orphan_worker_alive_is_held_during_teardown(self):
+        class KillingGpu(StubGpu):
+            def teardown(self):
+                self.torn_down += 1
+                os.kill(os.getpid(), signal.SIGTERM)
+                threading.Event().wait(0.05)
+                return True
+
+        endpoint = HangingEndpoint()
+        try:
+            with self.assertRaises(Terminated) as ctx:
+                guarded(endpoint=endpoint, gpu=KillingGpu(), request_timeout_s=0.05)
+        finally:
+            endpoint.release.set()
+        result = ctx.exception.run_result
+        self.assertEqual(result.status, RunStatus.STOPPED_AT_CAP)
+        self.assertTrue(result.teardown_confirmed)
+
+    def test_the_run_handlers_record_instead_of_raising_once_cleanup_is_active(self):
+        spend_guard._Cleanup.active = True
+        spend_guard._Cleanup.held = []
+        try:
+            spend_guard._raise_terminated(signal.SIGTERM, None)
+            spend_guard._raise_interrupt(signal.SIGINT, None)
+            self.assertEqual(spend_guard._Cleanup.held, [signal.SIGTERM, signal.SIGINT])
+        finally:
+            spend_guard._Cleanup.active = False
+            spend_guard._Cleanup.held = []
+        with self.assertRaises(Terminated):
+            spend_guard._raise_terminated(signal.SIGTERM, None)
+
     def test_the_handlers_are_restored_after_a_normal_run(self):
         before = signal.getsignal(signal.SIGTERM)
         guarded()

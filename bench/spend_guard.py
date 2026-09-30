@@ -31,12 +31,19 @@ a start times out, the guard waits a bounded time for the start to
 finish before it tears down; if the start is still in flight, the GPU
 could come up after the teardown, so the teardown counts as unconfirmed.
 
-During cleanup, SIGTERM, SIGHUP, and SIGINT are held, not acted on: the
-guard blocks them, installs handlers that only record them, and unblocks
-them, so none is dropped. After the teardown and the run record, the
-old handlers come back and a held signal is raised. A signal that lands
-in the few instructions before cleanup blocks them can still cut the
-cleanup short; the provider-side time limit covers that case.
+During cleanup, SIGTERM, SIGHUP, and SIGINT are held, not acted on. The
+first statement of cleanup sets a flag that makes the guard's handlers
+record a signal instead of raising. Every worker thread starts with the
+three signals blocked, so a signal sent to the process lands on the main
+thread. After the teardown and the run record, the old handlers come
+back and a held signal is raised. A signal that lands between the end of
+the run and the flag can still cut the cleanup short; the provider-side
+time limit covers that case.
+
+The start worker is known before the start is awaited, so on every exit,
+an interrupt included, a start still in flight is awaited for a bounded
+time before teardown, and the teardown counts as unconfirmed if the
+start is still running.
 
 A request, start, or teardown that times out keeps running on its worker
 thread. Repeated run_guarded calls in one process can leave such orphan
@@ -351,11 +358,25 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
-def _run_with_timeout(call, timeout_s: float, on_timeout: BaseException):
+class _Cleanup:
+    """Process-wide cleanup state. Once active, the guard's signal
+    handlers record a signal instead of raising, so nothing can cut the
+    teardown short. held collects the signals recorded."""
+
+    active = False
+    held: list = []
+
+
+def _run_with_timeout(call, timeout_s: float, on_timeout: BaseException, holder: Optional[dict] = None):
     """Run call() on a worker thread and wait at most timeout_s.
 
     A call that times out keeps running on its thread; the guard raises
-    on_timeout and moves on.
+    on_timeout and moves on. holder, if given, receives the thread before
+    the wait begins, so the caller can reach it on any exit, an interrupt
+    included.
+
+    The worker starts with SIGTERM, SIGHUP, and SIGINT blocked, and keeps
+    that mask, so a signal sent to the process lands on the main thread.
     """
     box = {}
 
@@ -366,7 +387,15 @@ def _run_with_timeout(call, timeout_s: float, on_timeout: BaseException):
             box["error"] = error
 
     worker = threading.Thread(target=work, name="spend-guard-call", daemon=True)
-    worker.start()
+    if holder is not None:
+        holder["worker"] = worker
+    can_mask = hasattr(signal, "pthread_sigmask")
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set(_CLEANUP_SIGNALS)) if can_mask else None
+    try:
+        worker.start()
+    finally:
+        if can_mask:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     worker.join(timeout_s)
     if worker.is_alive():
         if isinstance(on_timeout, CallTimedOut):
@@ -389,7 +418,17 @@ def _call_with_timeout(endpoint, request: Request, timeout_s: float, run_limited
 
 
 def _raise_terminated(signum, _frame):
+    if _Cleanup.active:
+        _Cleanup.held.append(signum)
+        return
     raise Terminated(signal.Signals(signum).name)
+
+
+def _raise_interrupt(signum, _frame):
+    if _Cleanup.active:
+        _Cleanup.held.append(signum)
+        return
+    raise KeyboardInterrupt
 
 
 def _save_signal_handlers(saved: dict) -> None:
@@ -400,9 +439,12 @@ def _save_signal_handlers(saved: dict) -> None:
 
 
 def _install_signal_handlers() -> None:
-    """While a run is live, SIGTERM and SIGHUP raise, so teardown runs."""
+    """While a run is live, SIGTERM and SIGHUP raise Terminated and SIGINT
+    raises KeyboardInterrupt, so teardown runs. Once cleanup is active,
+    each records the signal instead."""
     for signum in _RUN_SIGNALS:
         signal.signal(signum, _raise_terminated)
+    signal.signal(signal.SIGINT, _raise_interrupt)
 
 
 def _restore_signal_handlers(saved: dict) -> None:
@@ -416,7 +458,7 @@ def _hold_cleanup_signals() -> list:
     then unblock. A signal that arrived while blocked is delivered to the
     recording handler, so none is dropped. Returns the list of held
     signal numbers."""
-    held = []
+    held = _Cleanup.held
 
     def record(signum, _frame):
         held.append(signum)
@@ -533,9 +575,11 @@ def run_guarded(
         run_limit_s = min(run_time_limit_s, float(gpu_budget_seconds))
     pending = None
     interrupted = None
-    start_in_flight = None
+    start_holder = {}
     saved_handlers = {}
     _save_signal_handlers(saved_handlers)
+    _Cleanup.active = False
+    _Cleanup.held = []
     try:
         _install_signal_handlers()
         started_at = _monotonic()
@@ -543,7 +587,9 @@ def run_guarded(
         if gpu is not None:
             tally.hold(gpu_hold)
             gpu_started_at = _monotonic()
-            _run_with_timeout(gpu.start, gpu_call_timeout_s, CallTimedOut("the GPU start timed out"))
+            _run_with_timeout(
+                gpu.start, gpu_call_timeout_s, CallTimedOut("the GPU start timed out"), holder=start_holder
+            )
         for request in planned:
             bound = tally.bound(request, token_price)
             tally.reserve(bound)
@@ -565,7 +611,6 @@ def run_guarded(
     except CallTimedOut as timed_out:
         result.status = RunStatus.FAILED
         result.reason = f"the run failed: {timed_out}"
-        start_in_flight = timed_out.worker
     except Exception as error:  # noqa: BLE001 -- any endpoint or GPU fault fails the run
         result.status = RunStatus.FAILED
         result.reason = f"the run failed with {type(error).__name__}"
@@ -574,6 +619,7 @@ def run_guarded(
         result.reason = f"interrupted by {type(error).__name__}"
         interrupted = error
     finally:
+        _Cleanup.active = True
         held = _hold_cleanup_signals()
         try:
             if pending is not None and tally.spent_micros == pending[2]:
@@ -583,11 +629,13 @@ def run_guarded(
                 result.notes.append("a request in flight was counted at its reservation")
             if gpu is not None and gpu_started_at is not None:
                 start_still_running = False
-                if start_in_flight is not None:
-                    # A start that timed out may still bring the GPU up, so
-                    # wait a bounded time for it before tearing down.
-                    start_in_flight.join(max(1.0, gpu_call_timeout_s))
-                    start_still_running = start_in_flight.is_alive()
+                start_worker = start_holder.get("worker")
+                if start_worker is not None and start_worker.is_alive():
+                    # A start still running, after a timeout or an interrupt,
+                    # may yet bring the GPU up, so wait a bounded time for it
+                    # before tearing down.
+                    start_worker.join(max(1.0, gpu_call_timeout_s))
+                    start_still_running = start_worker.is_alive()
                 try:
                     confirmed = _run_with_timeout(
                         gpu.teardown, gpu_call_timeout_s, CallTimedOut("the GPU teardown timed out")
@@ -629,6 +677,7 @@ def run_guarded(
                 out.flush()
             finally:
                 _restore_signal_handlers(saved_handlers)
+                _Cleanup.active = False
                 # A signal held while the record was written still counts.
                 if interrupted is None:
                     interrupted = _held_interrupt(held)
