@@ -6,27 +6,46 @@ docs/specs/2026-09-30-vines-connectors-and-bench-threat-model.md in
 sageadvicellc/workbench:
 
 1. Before any run, it prints a cost estimate: the run count times the
-   price per run, with the price source named.
+   price per run, with the price source named. Beside it, it prints the
+   total of the planned request reservations and the GPU time budget.
 2. The run starts only after the founder types an exact "yes" at a
    terminal. No parameter, flag, or environment variable skips it.
-3. A hard cap on each run, enforced three ways: a token ceiling on each
-   request, a running tally of spend, and a stop before any request that
-   could pass the cap. The founder sets the cap value; this module has
-   no default for it.
+   isatty proves that a terminal is attached, not that a person typed
+   the yes.
+3. A hard cap on each run, enforced by a token ceiling on each request,
+   a running tally, a stop before any request that could pass the cap,
+   a timeout on each request, and a wall-clock limit on the run. The GPU
+   time budget is held inside the cap before the GPU starts, and the GPU
+   seconds used are charged to the tally. The founder sets the cap; this
+   module has no default for it.
 4. Any hosted GPU the run started is torn down at the end, on a stop at
-   the cap, and on any error. A run that cannot confirm the teardown is
-   reported as failed.
+   the cap, on any error, and on an interrupt, SIGTERM, or SIGHUP. A run
+   that cannot confirm the teardown is reported as failed. SIGKILL cannot
+   be caught, so every GPU also needs a provider-side time-to-live or
+   auto-stop as the backstop.
+
+The endpoint contract. The guard calls the endpoint once per request.
+The endpoint passes request.max_tokens to the provider as its output
+limit and reports it back as max_tokens_sent. It makes exactly one
+attempt, with the SDK's retries turned off, or it reports the number of
+attempts and the summed cost of all of them.
 
 Money is whole micro-dollars (millionths of a US dollar), never a float.
-The guard holds no credential and reads none. An endpoint's error text is
-never printed or recorded, only its type, so a key in an error message
-cannot leak through the guard.
+The guard derives each request's cost bound itself, from the request's
+input size, its max_tokens, and a named per-token price. It holds no
+credential and reads none. An endpoint's error text is never printed or
+recorded, only its type, so a key in an error message cannot leak.
 """
 
 from __future__ import annotations
 
 import enum
+import json
+import math
+import signal
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable, Iterable, Optional, Protocol, TextIO
@@ -38,6 +57,10 @@ def _is_whole(value) -> bool:
     """A plain int only: never a bool, a float, or an int subclass that
     could change its value between checks."""
     return type(value) is int
+
+
+def _is_positive_number(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
 def format_usd(micros: int) -> str:
@@ -94,18 +117,41 @@ class Estimate:
 
 
 @dataclass(frozen=True)
-class Request:
-    """One model request: its token ceiling, and the most it can cost."""
+class TokenPrice:
+    """The per-token price the guard bounds each request with."""
 
+    input_micros_per_token: int
+    output_micros_per_token: int
+    source: PriceSource
+
+    def __post_init__(self):
+        for value in (self.input_micros_per_token, self.output_micros_per_token):
+            if not _is_whole(value) or value < 0:
+                raise ValueError("a per-token price must be a whole number of 0 or more")
+        if not isinstance(self.source, PriceSource):
+            raise ValueError("a token price needs a price source")
+
+    def cost(self, input_tokens: int, output_tokens: int) -> int:
+        return input_tokens * self.input_micros_per_token + output_tokens * self.output_micros_per_token
+
+
+@dataclass(frozen=True)
+class Request:
+    """One model request: its input size in tokens, and its output limit."""
+
+    input_tokens: int
     max_tokens: int
-    max_cost_micros: int
 
 
 @dataclass(frozen=True)
 class Response:
+    """What the endpoint reports for one request, under its contract."""
+
     input_tokens: int
     output_tokens: int
     cost_micros: int
+    attempts: int
+    max_tokens_sent: int
 
 
 class TokenCeilingExceeded(Exception):
@@ -116,12 +162,33 @@ class CapReached(Exception):
     """A request could pass the cap, or spend has passed it."""
 
 
+class RequestTimedOut(CapReached):
+    """A request ran past its timeout."""
+
+
+class RunTimeLimitReached(CapReached):
+    """The run ran past its wall-clock limit."""
+
+
 class CostUnknown(Exception):
     """A request or response carries no valid cost, so spend is unknown."""
 
 
+class ContractBroken(Exception):
+    """The endpoint broke its contract, so its spend cannot be trusted."""
+
+
+class Terminated(BaseException):
+    """SIGTERM or SIGHUP arrived during a run."""
+
+
 class SpendTally:
-    """The running tally for one run, against its hard cap."""
+    """The running tally for one run, against its hard cap.
+
+    held_micros is spend set aside inside the cap but not yet used: the
+    GPU time budget, until the GPU is torn down and its real time is
+    charged.
+    """
 
     def __init__(self, cap_micros: int, max_tokens_per_request: int):
         if not _is_whole(cap_micros) or cap_micros < 1:
@@ -131,44 +198,69 @@ class SpendTally:
         self.cap_micros = cap_micros
         self.max_tokens_per_request = max_tokens_per_request
         self.spent_micros = 0
+        self.held_micros = 0
 
-    def reserve(self, request: Request) -> None:
-        """Refuse a request before it is sent if it breaks the ceiling or
-        could pass the cap at its most expensive."""
+    def hold(self, amount: int) -> None:
+        if self.spent_micros + self.held_micros + amount > self.cap_micros:
+            raise CapReached("the GPU time budget does not fit inside the hard cap")
+        self.held_micros += amount
+
+    def release(self, held: int, used: int) -> None:
+        self.held_micros -= held
+        self.spent_micros += used
+
+    def bound(self, request: Request, price: TokenPrice) -> int:
+        """Check a request's shape and ceiling, and return its cost bound."""
         if not _is_whole(request.max_tokens) or request.max_tokens < 1:
             raise TokenCeilingExceeded("a request has no valid token ceiling")
         if request.max_tokens > self.max_tokens_per_request:
             raise TokenCeilingExceeded("a request asked for more than the per-request token ceiling")
-        if not _is_whole(request.max_cost_micros) or request.max_cost_micros < 1:
-            raise CostUnknown("a request has no valid cost bound, so the cap cannot be held")
-        if self.spent_micros + request.max_cost_micros > self.cap_micros:
+        if not _is_whole(request.input_tokens) or request.input_tokens < 0:
+            raise CostUnknown("a request has no valid input size, so its cost cannot be bounded")
+        return price.cost(request.input_tokens, request.max_tokens)
+
+    def reserve(self, bound: int) -> None:
+        """Refuse a request before it is sent if it could pass the cap."""
+        if self.spent_micros + self.held_micros + bound > self.cap_micros:
             raise CapReached("the next request could pass the hard cap")
 
-    def settle(self, request: Request, response: Response) -> None:
-        """Add a response's cost to the tally, then stop the run if it cost
-        more than was reserved or spend has passed the cap.
+    def charge(self, amount: int) -> None:
+        self.spent_micros += amount
 
-        The tally counts the larger of the reported cost and the amount
-        reserved, so an endpoint that reports too little can never lower
-        it. The first response that costs more than its reservation is
-        already paid for when it is seen; it is recorded, and the run
-        stops there.
+    def settle(self, request: Request, bound: int, response: Response, price: TokenPrice) -> None:
+        """Charge a response, then stop the run if it broke a limit.
+
+        The charge is the largest of the reported cost, the bound times the
+        number of attempts, and the cost of the reported tokens at the
+        named price, so an endpoint that reports too little cannot lower
+        the tally.
         """
-        if not _is_whole(response.cost_micros) or response.cost_micros < 0:
-            self.spent_micros += request.max_cost_micros
-            raise CostUnknown("a response reported no valid cost")
-        self.spent_micros += max(response.cost_micros, request.max_cost_micros)
-        if not _is_whole(response.output_tokens) or response.output_tokens < 0:
-            raise CostUnknown("a response reported no valid token count")
+        fields = (response.input_tokens, response.output_tokens, response.cost_micros, response.max_tokens_sent)
+        if not all(_is_whole(value) and value >= 0 for value in fields) \
+                or not _is_whole(response.attempts) or response.attempts < 1:
+            self.charge(bound)
+            raise CostUnknown("a response did not report a valid cost, token count, or attempt count")
+        charged = max(
+            response.cost_micros,
+            bound * response.attempts,
+            price.cost(response.input_tokens, response.output_tokens),
+        )
+        self.charge(charged)
+        if response.max_tokens_sent != request.max_tokens:
+            raise ContractBroken("the endpoint did not pass the request's max_tokens to the provider")
         if response.output_tokens > request.max_tokens:
             raise CapReached("a response used more tokens than its request's ceiling")
-        if response.cost_micros > request.max_cost_micros:
+        if response.input_tokens > request.input_tokens:
+            raise CapReached("a response used more input tokens than the request planned")
+        if charged > bound:
             raise CapReached("a response cost more than the amount reserved for it")
-        if self.spent_micros > self.cap_micros:
+        if self.spent_micros + self.held_micros > self.cap_micros:
             raise CapReached("spend passed the hard cap")
 
 
 class GpuLease(Protocol):
+    price_per_second_micros: int
+
     def start(self) -> None: ...
 
     def teardown(self) -> bool:
@@ -192,6 +284,7 @@ class RunResult:
     estimate: Estimate
     spent_micros: int = 0
     requests_sent: int = 0
+    gpu_seconds: int = 0
     teardown_confirmed: Optional[bool] = None
     notes: list = field(default_factory=list)
 
@@ -203,9 +296,11 @@ class RunResult:
             "cap_micros": self.cap_micros,
             "spent_micros": self.spent_micros,
             "requests_sent": self.requests_sent,
+            "gpu_seconds": self.gpu_seconds,
             "teardown_confirmed": self.teardown_confirmed,
             "estimate_total_micros": self.estimate.total_micros,
             "price_source": self.estimate.source.name,
+            "notes": list(self.notes),
         }
 
 
@@ -213,43 +308,132 @@ def _stdin_is_tty() -> bool:
     return sys.stdin.isatty()
 
 
+def _out_is_tty(out: TextIO) -> bool:
+    return out.isatty()
+
+
 def _read_answer(prompt: str) -> str:
     return input(prompt)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _call_with_timeout(endpoint, request: Request, timeout_s: float, run_limited: bool) -> Response:
+    """Call the endpoint on a worker thread and wait at most timeout_s.
+
+    A request that times out keeps running on its thread, which is why
+    the GPU is torn down at once and the request is charged at its
+    reservation.
+    """
+    box = {}
+
+    def work():
+        try:
+            box["response"] = endpoint(request)
+        except BaseException as error:  # noqa: BLE001 -- handed back to the caller
+            box["error"] = error
+
+    worker = threading.Thread(target=work, name="spend-guard-request", daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
+        if run_limited:
+            raise RunTimeLimitReached("the run reached its wall-clock limit")
+        raise RequestTimedOut("a request ran past its timeout")
+    if "error" in box:
+        raise box["error"]
+    return box["response"]
+
+
+def _raise_terminated(signum, _frame):
+    raise Terminated(signal.Signals(signum).name)
+
+
+def _install_signal_handlers() -> dict:
+    """While a run is live, SIGTERM and SIGHUP raise, so teardown runs."""
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            previous[signum] = signal.signal(signum, _raise_terminated)
+    return previous
+
+
+def _restore_signal_handlers(previous: dict) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 def run_guarded(
     *,
     estimate: Estimate,
+    token_price: TokenPrice,
     cap_micros: int,
     max_tokens_per_request: int,
+    request_timeout_s: float,
+    run_time_limit_s: float,
     requests: Iterable[Request],
     endpoint: Callable[[Request], Response],
     out: TextIO,
     gpu: Optional[GpuLease],
+    gpu_budget_seconds: Optional[int],
 ) -> RunResult:
     """Print the estimate, get the founder's yes, then run the requests
     under the hard cap and tear down any GPU.
 
-    The yes is read from standard input, only when standard input is a
-    terminal. No argument approves on the founder's behalf. The requests
-    are read in full before the founder is asked, so the run cannot
-    change them after the yes.
+    The estimate and the prompt go to out, which must be the same terminal
+    the yes is typed at. No argument approves on the founder's behalf. The
+    requests are read in full before the founder is asked, so the run
+    cannot change them after the yes.
     """
     tally = SpendTally(cap_micros, max_tokens_per_request)
+    if not isinstance(token_price, TokenPrice):
+        raise ValueError("a run needs a named per-token price")
+    if not _is_positive_number(request_timeout_s) or not _is_positive_number(run_time_limit_s):
+        raise ValueError("request_timeout_s and run_time_limit_s must be positive numbers")
+    gpu_price = 0
+    gpu_hold = 0
+    if gpu is not None:
+        gpu_price = getattr(gpu, "price_per_second_micros", None)
+        if not _is_whole(gpu_price) or gpu_price < 0:
+            raise ValueError("a GPU lease needs a whole price_per_second_micros of 0 or more")
+        if not _is_whole(gpu_budget_seconds) or gpu_budget_seconds < 1:
+            raise ValueError("a run with a GPU needs a whole gpu_budget_seconds of 1 or more")
+        gpu_hold = gpu_budget_seconds * gpu_price
+    elif gpu_budget_seconds is not None:
+        raise ValueError("gpu_budget_seconds is only for a run with a GPU")
+
     planned = list(requests)
     result = RunResult(status=RunStatus.REFUSED, reason="", cap_micros=cap_micros, estimate=estimate)
+    try:
+        planned_bound = sum(tally.bound(request, token_price) for request in planned)
+    except (TokenCeilingExceeded, CostUnknown) as bad:
+        result.reason = f"the plan is invalid: {bad}"
+        out.write(f"Refused: {result.reason}.\n")
+        return result
 
     out.write(estimate.describe() + "\n")
     out.write(
-        f"Hard cap: {format_usd(cap_micros)} per run."
-        f" Token ceiling: {max_tokens_per_request} per request.\n"
+        f"Planned: {len(planned)} requests, reserved at up to {format_usd(planned_bound)}"
+        f" at the price from {token_price.source.name}.\n"
     )
-    if estimate.price_per_run_micros > cap_micros:
-        out.write("Note: the price per run is above the hard cap, so the run can stop at the cap.\n")
+    if gpu is not None:
+        out.write(
+            f"GPU budget: {gpu_budget_seconds} s x {format_usd(gpu_price)}/s = {format_usd(gpu_hold)},"
+            " held inside the cap.\n"
+        )
+    out.write(
+        f"Hard cap: {format_usd(cap_micros)} per run. Token ceiling: {max_tokens_per_request} per request."
+        f" Request timeout: {request_timeout_s} s. Run limit: {run_time_limit_s} s.\n"
+    )
+    if planned_bound + gpu_hold > cap_micros or estimate.price_per_run_micros > cap_micros:
+        out.write("Note: the plan can pass the hard cap, so the run can stop at the cap.\n")
     out.flush()
 
-    if not _stdin_is_tty():
-        result.reason = "the yes must be typed at a terminal, and no terminal is attached"
+    if not _stdin_is_tty() or not _out_is_tty(out):
+        result.reason = "the yes must be typed at a terminal that shows the estimate, and none is attached"
         out.write(f"Refused: {result.reason}.\n")
         return result
     try:
@@ -263,53 +447,82 @@ def run_guarded(
 
     result.status = RunStatus.COMPLETED
     result.reason = "every request finished under the cap"
-    gpu_started = False
+    gpu_started_at = None
+    run_limit_s = run_time_limit_s
+    if gpu is not None:
+        run_limit_s = min(run_time_limit_s, float(gpu_budget_seconds))
     pending = None
-    spent_before = 0
+    interrupted = None
+    previous_handlers = _install_signal_handlers()
     try:
+        started_at = _monotonic()
+        deadline = started_at + run_limit_s
         if gpu is not None:
-            gpu_started = True
+            tally.hold(gpu_hold)
+            gpu_started_at = _monotonic()
             gpu.start()
         for request in planned:
-            tally.reserve(request)
-            pending, spent_before = request, tally.spent_micros
-            response = endpoint(request)
+            bound = tally.bound(request, token_price)
+            tally.reserve(bound)
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                raise RunTimeLimitReached("the run reached its wall-clock limit")
+            timeout = min(request_timeout_s, remaining)
+            pending = (request, bound)
+            response = _call_with_timeout(endpoint, request, timeout, run_limited=timeout < request_timeout_s)
             result.requests_sent += 1
-            tally.settle(request, response)
             pending = None
+            tally.settle(request, bound, response, token_price)
     except (TokenCeilingExceeded, CapReached) as stop:
         result.status = RunStatus.STOPPED_AT_CAP
         result.reason = f"stopped at the cap: {stop}"
-    except CostUnknown as unknown:
+    except (CostUnknown, ContractBroken) as broken:
         result.status = RunStatus.FAILED
-        result.reason = f"the run failed: {unknown}"
+        result.reason = f"the run failed: {broken}"
     except Exception as error:  # noqa: BLE001 -- any endpoint or GPU fault fails the run
         result.status = RunStatus.FAILED
         result.reason = f"the run failed with {type(error).__name__}"
-        if pending is not None and tally.spent_micros == spent_before:
-            # A request that failed after it was sent may still be billed,
-            # so it counts at its full reservation.
-            tally.spent_micros += pending.max_cost_micros
-            result.notes.append("a failed request was counted at its reservation")
+    except BaseException as error:  # noqa: BLE001 -- an interrupt; recorded, then raised again
+        result.status = RunStatus.FAILED
+        result.reason = f"interrupted by {type(error).__name__}"
+        interrupted = error
     finally:
-        result.spent_micros = tally.spent_micros
-        if gpu is not None and gpu_started:
-            interrupted = None
-            try:
-                result.teardown_confirmed = gpu.teardown() is True
-            except BaseException as error:  # noqa: BLE001 -- a failed teardown is a failed run
-                result.teardown_confirmed = False
-                result.notes.append(f"teardown raised {type(error).__name__}")
-                if not isinstance(error, Exception):
-                    interrupted = error
-            if not result.teardown_confirmed:
-                result.status = RunStatus.FAILED
-                result.reason = f"{result.reason}; the GPU teardown was not confirmed"
-            if interrupted is not None:
-                raise interrupted
+        try:
+            if pending is not None:
+                # A request that was sent but not settled may still be
+                # billed, so it counts at its full reservation.
+                tally.charge(pending[1])
+                result.notes.append("a request in flight was counted at its reservation")
+            if gpu is not None and gpu_started_at is not None:
+                try:
+                    result.teardown_confirmed = gpu.teardown() is True
+                except BaseException as error:  # noqa: BLE001 -- a failed teardown is a failed run
+                    result.teardown_confirmed = False
+                    result.notes.append(f"teardown raised {type(error).__name__}")
+                    if not isinstance(error, Exception) and interrupted is None:
+                        interrupted = error
+                result.gpu_seconds = max(1, math.ceil(_monotonic() - gpu_started_at))
+                tally.release(gpu_hold, result.gpu_seconds * gpu_price)
+                if not result.teardown_confirmed:
+                    result.status = RunStatus.FAILED
+                    result.reason = f"{result.reason}; the GPU teardown was not confirmed"
+                elif tally.spent_micros > cap_micros and result.status is RunStatus.COMPLETED:
+                    result.status = RunStatus.STOPPED_AT_CAP
+                    result.reason = "the GPU time passed the hard cap"
+        finally:
+            _restore_signal_handlers(previous_handlers)
+            result.spent_micros = tally.spent_micros
+            out.write(
+                f"Run {result.status.value}: {result.reason}."
+                f" Spent {format_usd(result.spent_micros)} of a {format_usd(cap_micros)} cap.\n"
+            )
+            out.write("Record: " + json.dumps(result.as_record(), sort_keys=True) + "\n")
+            out.flush()
 
-    out.write(
-        f"Run {result.status.value}: {result.reason}."
-        f" Spent {format_usd(result.spent_micros)} of a {format_usd(cap_micros)} cap.\n"
-    )
+    if interrupted is not None:
+        try:
+            interrupted.run_result = result
+        except AttributeError:
+            pass
+        raise interrupted
     return result
